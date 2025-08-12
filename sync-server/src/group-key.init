@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=14
+KEY_FILE=/etc/dropbear/pregen_dropbear_rsa_host_key
+KEY_FILE_2048=/etc/dropbear/pregen_dropbear_rsa_2048_host_key
+
+boot() {
+    lock /tmp/.switch2jffs
+    mkdir -p /etc/dropbear
+    lock -u /tmp/.switch2jffs
+    chown root /etc/dropbear
+    chmod 0700 /etc/dropbear
+
+    start "$@"
+}
+
+start() {
+    lua -l luci.model.sync -e 'os.exit(luci.model.sync.load_group_key() and 0 or 1)'
+    [ -f $KEY_FILE ] || { /usr/bin/dropbearkey -t rsa -s 512 -f $KEY_FILE > /dev/null 2>&1 & }
+    [ -f $KEY_FILE_2048 ] || { /usr/bin/dropbearkey -t rsa -s 2048 -f $KEY_FILE_2048 > /dev/null 2>&1 & }
+}

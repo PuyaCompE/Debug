@@ -1,0 +1,79 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local dbg = require "luci.tools.debug"
+local uci  = require "luci.model.uci"
+local script = require "sync-script"
+local die = script.die
+local finalize = script.finalize
+local status = require "luci.tools.status"
+
+local safe_mem = 15 * 1024
+
+local infile = arg[1]
+local outfile = arg[2]
+local opcode = arg[3]
+
+script.outfile = outfile
+
+local function set_timeout(seconds)
+    local nixio = require "nixio"
+    local pid = nixio.getpid()
+    os.execute(string.format("(sleep %d; kill -9 %d 2>/dev/null) &", seconds, pid))
+end
+
+set_timeout(30)
+
+local function request(tmpcli)
+    --dbg("request:opcode is " .. opcode)
+    local model = require "luci.model.mode"
+    local ret, profile_safe_mem = model.is_mem_protect_support()
+    if ret == true then
+        if profile_safe_mem then
+            safe_mem = tonumber(profile_safe_mem)
+        end
+
+        local memava = status.get_mem_available()
+
+        if tonumber(memava) < safe_mem then
+            dbg("request Warning: memory less than " .. safe_mem)
+            os.exit(1)
+        end
+    end
+
+    local data, msg = tmpcli:request(opcode, {infile = infile})
+    if not data then
+        dbg("request failed: " .. tostring(msg))
+        os.exit(1)
+    end
+
+    local ok, decoded = pcall(json.decode, data)
+    if not ok then
+        dbg("JSON decode failed")
+        os.exit(1)
+    end
+
+    return true, decoded
+end
+
+local function main()
+    if tonumber(opcode) then
+        opcode = tonumber(opcode)
+    end
+    assert(opcode and infile and outfile, "invalid arguments")
+    assert(#arg > 3, "invalid arguments")
+
+    local uci_r = uci.cursor()
+    local usr = uci_r:get_profile("accountmgnt", "username")
+    local pwd = uci_r:get_profile("accountmgnt", "password")     
+
+    local data = script.reduce_concurrent(request, opcode, usr, pwd, arg, 4, #arg)
+    finalize(data)
+end
+
+local ok, err = pcall(main)
+if not ok then
+    finalize({success = -1, errmsg = tostring(err)})
+end
+os.exit(0)

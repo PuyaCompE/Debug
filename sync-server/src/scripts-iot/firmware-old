@@ -1,0 +1,120 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local dbg = require "luci.tools.debug"
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local subprocess = require "luci.model.subprocess"
+local script = require "sync-script"
+local die = script.die
+local finalize = script.finalize
+
+local infile = arg[1]
+local outfile = arg[2]
+local indata = nil
+
+script.outfile = outfile
+
+local function upgrade(tmpcli, ip, input, output)
+    tmpcli:set_timeout(30)
+    dbg("upgrade:begin")
+    local data, msg = tmpcli:request("CHECK_FIRMWARE", json.encode{
+                                         params = indata.params
+    })
+    data, msg = script.check_tmp_data(data, msg)
+--    print("upgrade check:" .. json.encode(data) .. "msg" .. msg)
+    if not data then
+        return nil, msg
+    end
+
+    local data, msg = tmpcli:request("SYNC_FIRMWARE", json.encode{
+                                         params = {
+                                             host = indata.ip,
+                                             filename = indata.firmware,
+                                             checksum = indata.checksum
+                                         }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+--    print("upgrade SYNC:" .. json.encode(data) .. "msg" .. msg)
+    if not data then
+        return nil, msg
+    end
+
+    -- We are done uploading
+    output:write(json.encode{rc = true, data = data})
+
+    local c = input:read(1)
+    if c == "0" then
+        dbg(pid, "die")
+        return nil, "canceled"
+    end
+
+    -- Start sync
+    local data, msg = tmpcli:request("SYNC_UPGRADE", json.encode{})
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    -- We are done syncing
+    return true, data
+end
+
+local function upgrade_all(b, e)
+    local workers = script.workers_create(upgrade, "CHECK_FIRMWARE", nil, nil, arg, b, e)
+
+    -- Wait until firmware is uploaded
+    script.workers_join(workers)
+
+    -- Notify workers to sync
+    for _, worker in ipairs(workers) do
+        if not worker.error then
+            local w = worker.output:write("1")
+            if w ~= 1 then
+                worker.error = "failed to write pipe"
+            end
+        end
+    end
+
+    -- Wait and grab output for firmware being synced
+    script.workers_join(workers)
+
+    script.workers_cleanup(workers)
+    return script.workers_reduce(workers)
+end
+
+local function main()
+    assert(infile and outfile, "invalid arguments")
+    assert(#arg > 3, "invalid arguments")
+
+    indata = script.read_infile(infile)
+    assert(indata.params and indata.firmware, "invalid data")
+
+    -- local nw = nw.init()
+    -- local net = nw:get_network("lan") or die("no network")
+    -- local ip = net:ipaddr()
+    -- TODO: Remove later.
+    ip = subprocess.call_output({"ifconfig", "br-lan"}):match("inet addr:([%d%.]+)")
+    assert(ip, "no IP")
+    indata.ip = ip
+
+    local result = subprocess.call_output({"md5sum", indata.firmware})
+    local checksum = result:match("%x+")
+    assert(checksum)
+
+    indata.checksum = checksum
+
+    local name = ("%d-%d"):format(os.time(), nixio.getpid())
+    local lnk = "/var/firmwares/" .. name
+    fs.symlink(indata.firmware, lnk)
+    indata.firmware = name
+
+    local data = upgrade_all(4, #arg)
+
+    fs.unlink(lnk)
+
+    finalize(data)
+end
+
+script.run(main)

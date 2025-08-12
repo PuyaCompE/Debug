@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+PROG=/usr/bin/sync-server
+
+RESPAWN_THRESHOLD=2592000
+RESPAWN_TIMEOUT=5
+RESPAWN_RETRIES=60
+
+start_service() {    
+    # when device boot, it will check mix network status
+    # liushuaiwei 2018/03/30
+    mix_network_check	
+    sync-check "version" 
+    sync-check "role"            
+    procd_open_instance
+    procd_set_param command "$PROG"
+    procd_set_param respawn ${RESPAWN_THRESHOLD} ${RESPAWN_TIMEOUT} ${RESPAWN_RETRIES}
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "bind_device_list"
+}
+
+reload_service() {    
+    # when bind_device_list changed, we will check mix network status
+    # liushuaiwei 2018/03/30
+    mix_network_check	
+    sync-check "role"
+    config_load sysmode
+	config_get system_mode sysmode mode "Router"
+	if [ "$system_mode" != "AP" ]; then
+		/etc/init.d/dhcp_hook_d restart
+	fi
+    config_load repacd
+    config_get device_type repacd 'DeviceType' 'RE'
+
+
+    [ "$device_type" != "AP" ] && {
+        return 0
+    }
+    rm /tmp/cloud_feature_upload
+    /usr/sbin/cloud_status_check > /dev/null 2>&1 &
+}

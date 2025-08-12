@@ -1,0 +1,70 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local subprocess = require "luci.model.subprocess"
+local dbg = require "luci.tools.debug"
+local util = require "luci.util"
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local Locker = require("luci.model.locker").Locker
+local script = require "sync-script"
+
+local CONFIG_LOCK = "/var/run/config.lock"
+
+local group = sync.read_group_info()
+local version = sync.get_config_version()
+local sync_ver = sync.get_sync_version()
+local config_file = nil
+
+local function update(tmpcli)
+    data, msg = tmpcli:request("SYNC_CHECK", json.encode{
+                                   params = {
+                                       group_id = group.gid,
+                                       config_version = version,
+                                       sync_version = sync_ver
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    data, msg = tmpcli:request("SYNC_CONFIG", {infile = config_file})
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    return true
+end
+
+local function main()
+    local num = tonumber(#arg/2)
+    dbg("Total %d devices need to be updated" % num)
+    -- FIXME X10 ignore temporarily | add later
+    -- local rc = subprocess.call({"fullband-switch"})   
+
+    config_file = "/tmp/config-sync-%d-%d.bin" % {os.time(), nixio.getpid()}
+
+    local locker = Locker(CONFIG_LOCK)
+    locker:lock()
+    rc = subprocess.call({"nvrammanager", "-p", "user-config", "-r", config_file})
+    locker:close()
+
+    if rc ~= 0 then
+        dbg("Failed to read config partition")
+        return 1
+    end
+
+    local data = script.iterate_request(update, "SYNC_CHECK", nil, nil, arg, 1, #arg)
+    if data.errmsg then
+        dbg("Warning: collected errors:", data.errmsg)
+    end
+    dbg("Total %d devices were updated successfully" % data.success)
+
+    fs.unlink(config_file)
+end
+
+script.run(main)

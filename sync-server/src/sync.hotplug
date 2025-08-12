@@ -1,0 +1,13 @@
+#!/bin/sh
+
+[ "$POINT" = END ] || exit 0
+
+[ "$SRCMODE" = "FAP" -a "$DSTMODE" = "HAP" ] && exit 0
+
+ubus call sync boost >/dev/null
+ubus call sync probe >/dev/null
+
+if [ "$SRCMODE" = "RE" ] && [ "$DSTMODE" = "FAP" -o "$DSTMODE" = "HAP" ]; then
+    rm -rf /var/run/record_* >/dev/null
+    rm -rf /var/run/lookup* >/dev/null
+fi

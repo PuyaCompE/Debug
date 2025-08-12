@@ -1,0 +1,154 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local dbg = require "luci.tools.debug"
+local uci = require "luci.model.uci"
+local script = require "sync-script"
+local update = require "update-info"
+local config = require "luci.sys.config"
+local ctl = require "luci.model.controller"
+local Locker = require("luci.model.locker").Locker
+
+local TMP_CHECK_DEV = "/tmp/check_dev"
+
+local group = sync.read_group_info()
+local my_devid = sync.get_device_id()
+
+local function get_cfg_arg(ip_devid, arg)
+    local data = {}
+    for ip, id in pairs(ip_devid) do
+        table.insert(data, ip)
+        for index=1, #arg do
+            if arg[index] == ip then
+                table.insert(data, arg[index+1])
+                break
+            end
+        end
+    end
+    return data
+end
+
+local function get_cfg_devid(ip_devid)
+    local data = {}
+    for ip, id in pairs(ip_devid) do
+        table.insert(data, id)
+    end
+    return data
+end
+
+local function get_info(tmpcli)
+    data, msg = tmpcli:request("SYNC_GET_INFO", json.encode{
+                                   params = {
+                                       group_id = group.gid,
+                                       master_devid = my_devid
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+    if update.add_to_table_record(data.result) == false then
+        return nil, "add_record"
+    end
+    update.update_compitable_list(data.result)
+    return true
+end
+
+local function get_cfg(tmpcli, ip)
+    local to_update_cfgs = update.get_cfgs(ip)
+    if update.is_nil_table(to_update_cfgs) then
+        return nil, "get_local_cfgs"
+    end
+    --dbg(" ip: " .. ip)
+    --dbg(" to_update_cfgs: " .. json.encode(to_update_cfgs))
+    data, msg = tmpcli:request("SYNC_GET_CFG", json.encode{
+                                   params = {
+                                       cfg = to_update_cfgs
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+    --dbg(" data.result: " .. json.encode(data.result))
+    if update.add_to_merge_cfgs(data.result) == false then
+        return nil, "add_cfgs"
+    end
+    return true
+end
+
+local function main()
+	local num = tonumber(#arg/2)
+    dbg(" Total %d devices need to get info" % num)
+    local uci_r = uci.cursor()
+    local usr = uci_r:get_profile("accountmgnt", "username")
+    local pwd = uci_r:get_profile("accountmgnt", "password")
+    local data = script.iterate_request(get_info, "SYNC_GET_INFO", usr, pwd, arg, 1, #arg)
+    if data.errmsg then
+      dbg("Warning: collected errors:", data.errmsg)
+    end
+    dbg("Total %d devices were got info successfully" % data.success)
+
+    if data.success > 0 then
+        if update.record_to_lookup_table() == false then
+            dbg("Error! record_to_lookup_table ")
+        end
+        local ip_item = update.get_update_ip_item()
+        if update.is_nil_table(ip_item) then
+            dbg(" ip_item is nil, no need to get cfg")
+        else
+            local cfg_arg = get_cfg_arg(ip_item, arg)
+            local num = tonumber(#cfg_arg/2)
+            dbg(" Total %d devices need to get cfg" % num)
+            local data = script.iterate_request(get_cfg, "SYNC_GET_CFG", usr, pwd, cfg_arg, 1, #cfg_arg)
+            dbg("Total %d devices were got cfg successfully" % data.success)
+            if data.errmsg then
+                local id_list = get_cfg_devid(ip_item)
+                dbg("data error, delete record id_list: " .. json.encode(id_list))
+                if update.delete_table_record(id_list) == false then
+                    dbg("Error! delete_table_record " .. json.encode(id_list))
+                end
+                if update.record_to_lookup_table() == false then
+                    dbg("Error! record_to_lookup_table ")
+                end
+                dbg("Warning: collected errors:", data.errmsg)
+            else
+                if data.success > 0 then
+                    local merge_cfgs = update.get_update_user_config()
+                    if update.is_nil_table(merge_cfgs) then
+                        dbg(" merge_cfgs is nil , don't update user_config. ")
+                    else
+                        locker = Locker(sync.CONFIG_LOCK)
+                        if not locker:tlock() then
+                            local id_list = get_cfg_devid(ip_item)
+                            dbg("user_config is locking, delete record id_list: " .. json.encode(id_list))
+                            if update.delete_table_record(id_list) == false then
+                                dbg("Error! delete_table_record " .. json.encode(id_list))
+                            end
+                            if update.record_to_lookup_table() == false then
+                                dbg("Error! record_to_lookup_table ")
+                            end
+                        else
+                            local ver = uci_r:get("sync", "config", "version")
+                            ver_new = sync.update_config_version(ver)
+                            dbg(" ver: " .. ver .. " ver_new: " .. ver_new)
+                            dbg(" merge_cfgs: " .. json.encode(merge_cfgs))
+                            config.merge_user_config(merge_cfgs, ver_new)
+                            config.reload_user_config()
+                            locker:close()
+                            ctl.uci_apply()
+                            dbg(" update user_config finish ")
+                        end
+                    end
+                end
+            end
+        end
+        
+        update.update_dev_list()
+        update.update_role_info()
+    end
+end
+
+script.run(main)

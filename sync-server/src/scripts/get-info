@@ -1,0 +1,375 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local dbg = require "luci.tools.debug"
+local uci = require "luci.model.uci"
+local script = require "sync-script"
+local update = require "update-info"
+local config = require "luci.sys.config"
+local ctl = require "luci.model.controller"
+local Locker = require("luci.model.locker").Locker
+local RECORD_DEVID = "/var/run/record_devid"
+local RECORD_DEVID_LOCK = "/var/run/record_devid.lock"
+local TMP_CHECK_DEV = "/tmp/check_dev"
+local TMP_CHECK_DEV_LOCK = "/tmp/check_dev.lock"
+local MAX_RECORD = "/var/run/max_record"
+
+local HAS_GOT_INFO = 0
+local NEED_TO_GET_INFO = 1
+local INFO_OVERDUE = 2
+
+local TMP_CHECK_DEV = "/tmp/check_dev"
+
+local group = sync.read_group_info()
+local my_devid = sync.get_device_id()
+
+local function get_cfg_arg(ip_devid, arg)
+    local data = {}
+    for ip, id in pairs(ip_devid) do
+        table.insert(data, ip)
+        for index=1, #arg do
+            if arg[index] == ip then
+                table.insert(data, arg[index+1])
+                break
+            end
+        end
+    end
+    return data
+end
+
+local function get_cfg_devid(ip_devid)
+    local data = {}
+    for ip, id in pairs(ip_devid) do
+        table.insert(data, id)
+    end
+    return data
+end
+
+local function add_to_sync_list(form)
+    --add extended_attr to sync list 
+    local sys = require "luci.sys"
+    local ubus = require "ubus"
+    local conn = ubus.connect()
+
+    local args = {}
+    args.handle_type = "add_extended_attr"
+    args.handle_id = form.device_id
+    if form.extended_attr ~= nil then
+        args.data = form.extended_attr
+    end
+    dbg.print("add_extended_attr args: " .. json.encode(args))
+    conn:call("sync", "device", args) 
+    conn:close()
+end
+
+local function get_info(tmpcli)
+    data, msg = tmpcli:request("SYNC_GET_INFO", json.encode{
+                                   params = {
+                                       group_id = group.gid,
+                                       master_devid = my_devid,
+                                       re_based_comp_support = true
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+    if update.add_to_table_record(data.result) == false then
+        return nil, "add_record"
+    end
+
+    if update.add_to_max_record(data.result) == false then
+        return nil, "add_record"
+    end
+
+    if data.result.extended_attr ~= nil then
+        local form = {}
+        form.device_id = data.result.devid
+        form.extended_attr = data.result.extended_attr
+        add_to_sync_list(form)
+    end
+    if update.add_to_max_record(data.result) == false then
+        return nil, "add_record"
+    end
+    update.update_compitable_list(data.result)
+    update.update_usb_status(data.result)
+    return true
+end
+
+local function get_cfg(tmpcli, ip)
+    local to_update_cfgs = update.get_cfgs(ip)
+    if update.is_nil_table(to_update_cfgs) then
+        return nil, "get_local_cfgs"
+    end
+    --dbg(" ip: " .. ip)
+    --dbg(" to_update_cfgs: " .. json.encode(to_update_cfgs))
+    data, msg = tmpcli:request("SYNC_GET_CFG", json.encode{
+                                   params = {
+                                       cfg = to_update_cfgs
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+    --dbg(" data.result: " .. json.encode(data.result))
+    if update.add_to_merge_cfgs(data.result) == false then
+        return nil, "add_cfgs"
+    end
+    return true
+end
+
+local function check_get_info_status( devid , fw_version, max_record)
+    if not max_record or not max_record[devid] then
+        return NEED_TO_GET_INFO
+    end
+
+    if not fw_version or fw_version ~= max_record[devid].fw_version then
+        return INFO_OVERDUE
+    end
+
+    return HAS_GOT_INFO
+end
+
+local function get_dev_by_ip( ip, devlist )
+    for devid, dev in pairs(devlist) do
+        if dev.ip == ip then
+            dev.devid = devid
+            return dev
+        end
+    end
+    dbg("ip not found in devlist")
+    return nil
+end
+
+local function add_to_record_devid( devid )
+    local Locker = require("luci.model.locker").Locker
+    local locker = Locker(RECORD_DEVID_LOCK)
+    locker:lock()
+    local fp = io.open(RECORD_DEVID, "r")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local record_devid = json.decode(lines)
+    table.insert(record_devid, devid) -- chongfu?
+
+    local fp = io.open(RECORD_DEVID, "w")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+    fp:write(json.encode(record_devid))
+    fp:close()
+    locker:ulock()
+    dbg("add to record devid again", devid)
+    return true
+end
+
+local function add_to_tmp_check( ip, devid )
+    local Locker = require("luci.model.locker").Locker
+    local locker = Locker(TMP_CHECK_DEV_LOCK)
+    locker:lock()
+    local fp = io.open(TMP_CHECK_DEV, "r")
+
+    local lines
+    if fp then
+        lines = fp:read("*all")
+        fp:close()
+    end
+    local tmp_check_dev = json.decode(lines) or {}
+    tmp_check_dev[ip] = devid
+
+    local fp = io.open(TMP_CHECK_DEV, "w")
+    if fp == nil then
+        dbg("error open file failed:" .. TMP_CHECK_DEV)
+        return false
+    end
+    fp:write(json.encode(tmp_check_dev))
+    fp:close()
+    locker:ulock()
+    return true
+end
+
+
+local function find_has_got_record_dev( args )
+    local res = {}
+    local to_delete_info = {}
+    local has_got_info_devs = 0
+    local ubus   = require "ubus"
+    local _ubus = ubus.connect()        
+    local devlist = _ubus:call("sync", "list", {}) 
+    _ubus:close()
+
+    local fp = io.open(MAX_RECORD, "r")
+    local max_record = {}
+    if fp == nil then
+        dbg("error open file failed:" .. MAX_RECORD)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        max_record = json.decode(lines)
+    end
+
+    for i = 1, #args, 2 do
+        local dev = get_dev_by_ip(args[i], devlist)
+        if dev then
+            local status = check_get_info_status(dev.devid, dev.fw_version, max_record)
+            if NEED_TO_GET_INFO == status then
+                res[#res + 1] = args[i]
+                res[#res + 1] = args[i + 1]
+            elseif HAS_GOT_INFO == status then
+                add_to_record_devid(dev.devid)
+                add_to_tmp_check(args[i], dev.devid)
+                has_got_info_devs = has_got_info_devs + 1
+            else
+                dbg("dev's fw_version update, rm old record first")
+                to_delete_info[#to_delete_info + 1] = dev.devid
+            end
+        end
+    end
+
+    if #to_delete_info > 0 then
+        if update.delete_table_record(to_delete_info) == false then
+            dbg("Error! delete_table_record " .. json.encode(arg))
+        else
+            update.delete_max_record(to_delete_info)
+        end
+
+    end
+
+    return res, has_got_info_devs
+end
+
+local function is_in_record(devid)
+    local fp = io.open(RECORD_DEVID, "r")
+
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local record_devid = json.decode(lines)
+    if record_devid == nil then
+        dbg("is_in_record: record_devid is nil, return false")
+        return false
+    end
+
+    for i=1,#record_devid do
+        if record_devid[i] == devid then
+            --dbg(devid .." is in record_devid")
+            return true
+        end
+    end
+    return false
+end
+
+
+local function main()
+	local num = tonumber(#arg/2)
+    dbg(" Total %d devices need to get info" % num)
+    if sync.get_onboarding_status() and is_in_record(my_devid) then
+        dbg("get-info: onboarding now , stop get-info until onboarding done")
+        return
+    end
+    local uci_r = uci.cursor()
+        local has_got_info_devs = 0
+    new_arg, has_got_info_devs = find_has_got_record_dev(arg)
+    local data = {}
+    if #new_arg > 0 then
+        local usr = uci_r:get_profile("accountmgnt", "username")
+        local pwd = uci_r:get_profile("accountmgnt", "password")
+        data = script.iterate_request(get_info, "SYNC_GET_INFO", usr, pwd, new_arg, 1, #new_arg)
+        if data.errmsg then
+          dbg("Warning: collected errors:", data.errmsg)
+        end
+        dbg("Total %d devices were got info successfully" % data.success)
+    end
+    if num > 0 then
+        local my_role = sync.get_role()
+        if my_role == "AP" then
+            local tipc_config = require "luci.model.tipc_config"
+            dbg("sync tipc list to all")
+            tipc_config.send_tipc_update_notification("RE")
+        end
+    end
+
+    if data.success then
+        data.success = data.success + has_got_info_devs
+    else
+        data.success = has_got_info_devs
+    end
+
+    if data.success > 0 then
+        if has_got_info_devs > 0 then
+            update.check_comp_whole_leave()
+        end
+        if update.record_to_lookup_table() == false then
+            dbg("Error! record_to_lookup_table ")
+        end
+        local ip_item = update.get_update_ip_item()
+        if update.is_nil_table(ip_item) then
+            dbg(" ip_item is nil, no need to get cfg")
+        else
+            local cfg_arg = get_cfg_arg(ip_item, arg)
+            local num = tonumber(#cfg_arg/2)
+            dbg(" Total %d devices need to get cfg" % num)
+            local data = script.iterate_request(get_cfg, "SYNC_GET_CFG", usr, pwd, cfg_arg, 1, #cfg_arg)
+            dbg("Total %d devices were got cfg successfully" % data.success)
+            if data.errmsg then
+                local id_list = get_cfg_devid(ip_item)
+                dbg("data error, delete record id_list: " .. json.encode(id_list))
+                if update.delete_table_record(id_list) == false then
+                    dbg("Error! delete_table_record " .. json.encode(id_list))
+                end
+                update.delete_max_record(id_list)
+                if update.record_to_lookup_table() == false then
+                    dbg("Error! record_to_lookup_table ")
+                end
+                dbg("Warning: collected errors:", data.errmsg)
+            else
+                if data.success > 0 then
+                    local merge_cfgs = update.get_update_user_config()
+                    if update.is_nil_table(merge_cfgs) then
+                        dbg(" merge_cfgs is nil , don't update user_config. ")
+                    else
+                        locker = Locker(sync.CONFIG_LOCK)
+                        if not locker:tlock() then
+                            local id_list = get_cfg_devid(ip_item)
+                            dbg("user_config is locking, delete record id_list: " .. json.encode(id_list))
+                            if update.delete_table_record(id_list) == false then
+                                dbg("Error! delete_table_record " .. json.encode(id_list))
+                            end
+                            if update.record_to_lookup_table() == false then
+                                dbg("Error! record_to_lookup_table ")
+                            end
+                        else
+                            local ver = uci_r:get("sync", "config", "version")
+                            ver_new = sync.update_config_version(ver)
+                            dbg(" ver: " .. ver .. " ver_new: " .. ver_new)
+                            dbg(" merge_cfgs: " .. json.encode(merge_cfgs))
+                            config.merge_user_config(merge_cfgs, ver_new)
+                            config.reload_user_config()
+                            locker:close()
+                            ctl.uci_apply()
+                            dbg(" update user_config finish ")
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- update.update_dev_list()
+        update.update_re_offline_dev_list()
+        update.update_role_info()
+    end
+end
+
+script.run(main)

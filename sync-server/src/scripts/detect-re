@@ -1,0 +1,240 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local dbg = require "luci.tools.debug"
+local script = require "sync-script"
+local update = require "update-info"
+local subprocess = require "luci.model.subprocess"
+local Locker = require("luci.model.locker").Locker
+local ubus  = require "ubus"
+
+local RECORD_DEVID = "/var/run/record_devid"
+local RECORD_DEVID_LOCK = "/var/run/record_devid.lock"
+local MESH_DEV_LIST = "/tmp/sync-server/mesh_dev_list"
+local MAJOR_RE_LIST = "/var/run/major_re"
+local my_devid = sync.get_device_id()
+local group = sync.read_group_info()
+local MAX_RECORD = "/var/run/max_record"
+
+local function detect_re(tmpcli)
+    data, msg = tmpcli:request("SYNC_DETECT_SLAVE", json.encode{
+                                   params = {
+                                       group_id = group.gid
+                                   }
+    })
+
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    return true
+end
+
+
+local function get_data(path)
+    local fp = io.open(path, "r")
+    local data = {}
+    if fp == nil then
+        dbg("error open file failed:" .. path)
+        return data
+    end
+    local lines = fp:read("*all")
+    fp:close()
+    data = json.decode(lines)
+    return data
+end
+
+local function is_major_re( devid )
+    local fp = io.open(MAJOR_RE_LIST, "r")
+    if fp == nil then
+        dbg("error open file failed:" .. MAJOR_RE_LIST)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local major_re_list = json.decode(lines)
+    if major_re_list[devid[1]] then
+        return true
+    end
+    return false
+end
+
+local function delete_record_devid( devid )
+    local locker = Locker(RECORD_DEVID_LOCK)
+    locker:lock()
+    local fp = io.open(RECORD_DEVID, "r")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local record_devid = json.decode(lines)
+    for i=#record_devid, 1, -1 do
+        if record_devid[i] == devid then
+            table.remove(record_devid, i)
+            dbg("delete record_devid success:", devid)
+            break
+        end
+    end
+
+    local fp = io.open(RECORD_DEVID, "w")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+    fp:write(json.encode(record_devid))
+    fp:close()
+    locker:ulock()
+    return true
+end
+
+local function main()
+    local nixio  = require "nixio"
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    local my_mode = uci_s:get("repacd", "repacd", "DeviceType")
+
+    if my_mode ~= "AP" then
+        return
+    end
+
+    if sync.get_onboarding_status() then
+        dbg("onboarding now, stop detect_re")
+        return
+    end
+
+    local fp = io.open(MAX_RECORD, "r")
+    local max_record = {}
+    if fp == nil then
+        --dbg("error open file failed:" .. MAX_RECORD)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        max_record = json.decode(lines) or {}
+    end
+
+    local record_devid = get_data(RECORD_DEVID)
+    local mesh_dev_list = get_data(MESH_DEV_LIST)
+
+    if update.is_nil_table(record_devid) or update.is_nil_table(mesh_dev_list) then
+        dbg("error: record_devid or mesh_dev_list is nil, do nothing")
+        return
+    end
+
+    local is_delete = false
+    local major_re_leave = false
+    local offline_id_list = {}
+    for index=1, #record_devid do
+        local recode_id = record_devid[index]
+        local dev_info = mesh_dev_list[recode_id]
+        if recode_id ~= my_devid then
+            local id_list ={}
+            if dev_info == nil then
+                id_list = {recode_id}
+                dbg("in record_devid but not in mesh_dev_list, delete record " .. json.encode(id_list))
+            else
+                local ip = dev_info["ip"]
+                local arg = {ip, "1"}
+                --local data = script.iterate_request(detect_re, nil, nil, arg, 1, #arg)
+                --if data.errmsg then
+                local rc = subprocess.call({"ping", "-q", "-c", "1", "-W" , "1", ip})
+                if rc ~=0 then
+                    -- try again
+                    rc = subprocess.call({"ping", "-q", "-c", "1", "-W" , "1", ip})
+                    if rc ~=0 then
+                        id_list = {recode_id}
+                        dbg("detect_re error, delete record " .. json.encode(id_list))
+                        local uci_r = uci.cursor()
+                        local dcmp_support = uci_r:get_profile("dcmp", "support") or "no"
+                        if dcmp_support == "yes" and recode_id then
+                            local dcmp = require "cloud.tp_apps.dcmp"
+                            local nickname = uci_r:get("bind_device_list", recode_id, "nickname") or ""
+                            nickname = require("luci.model.app_cloudfirm").format_nickname(nickname) or {}
+                            local name
+                            if nickname.custom_nickname then
+                                name = nixio.bin.b64decode(nickname.custom_nickname)
+                            else
+                                name = nickname.nickname
+                            end
+                            dcmp.log("Deco " .. name .. " disconnected from Network")
+                        end
+                    end
+                end
+            end
+            if #id_list > 0 then
+                table.insert(offline_id_list, id_list[1])
+
+                if is_major_re(id_list) then
+                    major_re_leave = true
+                else
+                    dbg(json.encode(id_list[1]), "is not major re")
+                end
+                if max_record[id_list[1]] then
+                    -- 新固件，仅记录离线
+                    if delete_record_devid(id_list[1]) == false then
+                        dbg("Error! delete_record_devid " .. json.encode(id_list))
+                    end
+                else
+                    -- 旧固件，删除完整信息，之后重新获取
+                    major_re_leave = true
+                    if update.delete_table_record(id_list) == false then
+                        dbg("Error! delete_table_record " .. json.encode(id_list))
+                    end
+                end
+                is_delete = true
+                -- if update.delete_table_record(id_list) == false then
+                --     dbg("Error! delete_table_record " .. json.encode(id_list))
+                -- end
+                -- if update.record_to_lookup_table() == false then
+                --     dbg("Error! record_to_lookup_table ")
+                -- end
+            end
+        end
+    end
+    if #offline_id_list > 0 then
+        local _ubus_c = ubus.connect()
+        local args = {}
+        local data = {}
+
+        for index=1, #offline_id_list do
+            args = {}
+            args.handle_type = "simple_remove"
+            args.handle_id = offline_id_list[index]
+    
+            _ubus_c:call("sync", "device", args)
+            dbg("ubus call sync device: " .. offline_id_list[index])
+        end
+
+        data.params = {}
+        data.params.data = {}
+        data.params.data.offline_id_list = offline_id_list
+
+        args = {}
+        args.opcode = tonumber(0xc710)
+        args.target_type = "RE"
+        args.data = data
+
+        _ubus_c:call("sync", "request", args)
+        _ubus_c:close()
+    end
+    if major_re_leave then
+           if update.record_to_lookup_table() == false then
+                dbg("Error! record_to_lookup_table ")
+            else
+                update.update_role_info()
+            end
+    end
+    -- if is_delete == true then
+        
+    --     --update.update_dev_list()
+    --     update.update_role_info()
+    -- end
+end
+
+script.run(main)

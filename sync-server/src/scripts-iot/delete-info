@@ -1,0 +1,22 @@
+#!/usr/bin/lua
+
+local json = require "luci.json"
+local dbg = require "luci.tools.debug"
+local script = require "sync-script"
+local update = require "update-info"
+
+local function main()
+    dbg(" Total %d devices need to delete info" % #arg)
+
+    if update.delete_table_record(arg) == false then
+    	dbg("Error! delete_table_record " .. json.encode(arg))
+    end
+    if update.record_to_lookup_table() == false then
+    	dbg("Error! record_to_lookup_table ")
+    end
+    
+    update.update_dev_list()
+    update.update_role_info()
+end
+
+script.run(main)

@@ -1,0 +1,69 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local subprocess = require "luci.model.subprocess"
+local dbg = require "luci.tools.debug"
+local util = require "luci.util"
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local Locker = require("luci.model.locker").Locker
+local script = require "sync-script"
+
+local EMMC_CONFIG_LOCK = "/var/run/emmc_config.lock"
+
+local group = sync.read_group_info()
+local sync_ver = sync.get_sync_version()
+local emmc_version = sync.get_emmc_config_version()
+local emmc_config_file = nil
+
+local function update_emmc_config(tmpcli)
+    data, msg = tmpcli:request("SYNC_EMMC_CHECK", json.encode{
+                                   params = {
+                                       group_id = group.gid,
+                                       emmc_config_version = emmc_version,
+                                       sync_version = sync_ver
+                                   }
+    })
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+
+    data, msg = tmpcli:request("SYNC_EMMC_CONFIG", {infile = emmc_config_file})
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    return true
+end
+
+local function main()
+    dbg("Total %d devices need to be updated" % #arg)
+	
+    emmc_config_file = "/tmp/emmc-config-sync-%d-%d.bin" %{os.time(), nixio.getpid()}
+      
+    local locker = Locker(EMMC_CONFIG_LOCK)
+    locker:lock()
+
+    local rc = subprocess.call({"nvrammanager", "-p", "emmc-config", "-r", emmc_config_file})
+    locker:close()
+
+    if rc ~= 0 then
+        dbg("Failed to read emmc-config partition")
+        return 1
+    end
+
+    local data = script.reduce_concurrent(update_emmc_config, "SYNC_EMMC_CHECK", nil, nil, arg, 1, #arg)
+    if data.errmsg then
+        dbg("Warning: collected errors:", data.errmsg)
+    end
+        dbg("Total %d devices were updated successfully" % data.success)
+    
+    fs.unlink(emmc_config_file)
+end
+
+script.run(main)

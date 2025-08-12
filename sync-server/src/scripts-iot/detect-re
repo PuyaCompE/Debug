@@ -1,0 +1,112 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local sync = require "luci.model.sync"
+local dbg = require "luci.tools.debug"
+local script = require "sync-script"
+local update = require "update-info"
+
+local RECORD_DEVID = "/var/run/record_devid"
+local MESH_DEV_LIST = "/tmp/sync-server/mesh_dev_list"
+local my_devid = sync.get_device_id()
+local group = sync.read_group_info()
+
+local function detect_re(tmpcli)
+    data, msg = tmpcli:request("SYNC_DETECT_SLAVE", json.encode{
+                                   params = {
+                                       group_id = group.gid
+                                   }
+    })
+
+    data, msg = script.check_tmp_data(data, msg)
+    if not data then
+        return nil, msg
+    end
+
+    return true
+end
+
+local function get_data(path)
+    local fp = io.open(path, "r")
+    local data = {}
+    if fp == nil then
+        dbg("error open file failed:" .. path)
+        return data
+    end
+    local lines = fp:read("*all")
+    fp:close()
+    data = json.decode(lines)
+    return data
+end
+
+local function main()
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    local my_mode = uci_s:get("repacd", "repacd", "DeviceType")
+    local nixio  = require "nixio"
+    
+    if my_mode ~= "AP" then
+        return
+    end
+
+    local record_devid = get_data(RECORD_DEVID)
+    local mesh_dev_list = get_data(MESH_DEV_LIST)
+
+    if update.is_nil_table(record_devid) or update.is_nil_table(mesh_dev_list) then
+        dbg("error: record_devid or mesh_dev_list is nil, do nothing")
+        return
+    end
+
+    local is_delete = false
+    for index=1, #record_devid do
+        local recode_id = record_devid[index]
+        local dev_info = mesh_dev_list[recode_id]
+        if recode_id ~= my_devid then
+            local id_list ={}
+            if dev_info == nil then
+                id_list = {recode_id}
+                dbg("in record_devid but not in mesh_dev_list, delete record " .. json.encode(id_list))
+            else
+                local ip = dev_info["ip"]
+                local arg = {ip, "1"}
+                local data = script.iterate_request(detect_re, "SYNC_DETECT_SLAVE", nil, nil, arg, 1, #arg)
+                if data.errmsg then
+                    id_list = {recode_id}
+                    dbg("Warning: collected errors:", data.errmsg)
+                    dbg("detect_re error, delete record " .. json.encode(id_list))
+                    local uci_r = uci.cursor()
+                    local dcmp_support = uci_r:get_profile("dcmp", "support") or "no"
+                    if dcmp_support == "yes" and recode_id then
+                        local dcmp = require "cloud.tp_apps.dcmp"
+                        local nickname = uci_r:get("bind_device_list", recode_id, "nickname") or ""
+                        nickname = require("luci.model.app_cloudfirm").format_nickname(nickname) or {}
+                        local name
+                        if nickname.custom_nickname then
+                            name = nixio.bin.b64decode(nickname.custom_nickname)
+                        else
+                            name = nickname.nickname
+                        end
+                        dcmp.log("Deco " .. name .. " disconnected from Network")
+                    end
+                end
+            end
+            if #id_list > 0 then
+                is_delete = true
+                if update.delete_table_record(id_list) == false then
+                    dbg("Error! delete_table_record " .. json.encode(id_list))
+                end
+                if update.record_to_lookup_table() == false then
+                    dbg("Error! record_to_lookup_table ")
+                end
+            end
+        end
+    end
+    if is_delete == true then
+        
+        update.update_dev_list()
+        update.update_role_info()
+    end
+end
+
+script.run(main)

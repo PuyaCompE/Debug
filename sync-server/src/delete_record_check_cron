@@ -1,0 +1,22 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+
+USE_PROCD=1
+
+local crontabs_root=/etc/crontabs/root
+local delete_check_crontab_cmd="*/15 * * * * lua /lib/sync-server/scripts/delete_record_later.lua"
+
+start_service() {
+	
+	echo "firmware check crontab cmd: $delete_check_crontab_cmd" > /dev/console
+    echo "$delete_check_crontab_cmd" >> /etc/crontabs/root
+    /etc/init.d/cron restart
+}
+
+stop_service() {
+ 	if [ -f $crontabs_root ]; then
+        sed -i "/delete_record_later.lua$/d" /etc/crontabs/root
+        /etc/init.d/cron restart
+    fi
+}

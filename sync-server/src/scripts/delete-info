@@ -1,0 +1,154 @@
+#!/usr/bin/lua
+
+local json = require "luci.json"
+local dbg = require "luci.tools.debug"
+local script = require "sync-script"
+local update = require "update-info"
+local Locker = require("luci.model.locker").Locker
+
+local RECORD_DEVID = "/var/run/record_devid"
+local RECORD_DEVID_LOCK = "/var/run/record_devid.lock"
+local MAJOR_RE_LIST = "/var/run/major_re"
+local TO_DELETE_INFO = "/tmp/sync-server/to_delete_info"
+local TO_DELETE_INFO_LOCK = "/tmp/sync-server/to_delete_info.lock"
+local MAX_RECORD = "/var/run/max_record"
+
+
+local function delete_record_devid( devid_list )
+    local locker = Locker(RECORD_DEVID_LOCK)
+    locker:lock()
+    local fp = io.open(RECORD_DEVID, "r")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local record_devid = json.decode(lines)
+
+    if type(devid_list) == "string" then
+        devid_list = {devid_list}
+    end
+    for j=1,#devid_list do
+        local devid = devid_list[j]
+        for i=#record_devid, 1, -1 do
+            if record_devid[i] == devid then
+                table.remove(record_devid, i)
+                dbg("delete record_devid success:", devid)
+                break
+            end
+        end
+    end
+
+    local fp = io.open(RECORD_DEVID, "w")
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+    fp:write(json.encode(record_devid))
+    fp:close()
+    locker:ulock()
+    return true
+end
+
+local function save_to_delete_info(data)
+    local locker = Locker(TO_DELETE_INFO_LOCK)
+    locker:lock()
+    local fp = io.open(TO_DELETE_INFO, "r")
+    -- if fp == nil then
+    --     dbg("error open file failed:" .. TO_DELETE_INFO)
+    --     return false
+    -- end
+
+    local lines 
+    if fp then
+        lines = fp:read("*all")
+        fp:close()
+    end
+    local to_delete_info = json.decode(lines) or {}
+
+    for i=1,#data do
+        table.insert(to_delete_info, data[i])
+        dbg("save "..data[i].."to /tmp/sync-server/to_delete_info")
+    end
+
+    local fp = io.open(TO_DELETE_INFO, "w")
+    if fp == nil then
+        dbg("error open file failed:" .. TO_DELETE_INFO)
+        return false
+    end
+    fp:write(json.encode(to_delete_info))
+    fp:close()
+    locker:ulock()
+    return true
+end
+
+local function is_major_re( devid )
+    local fp = io.open(MAJOR_RE_LIST, "r")
+    if fp == nil then
+        dbg("error open file failed:" .. MAJOR_RE_LIST)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local major_re_list = json.decode(lines)
+    if major_re_list[devid] then
+        return true
+    end
+    return false
+end
+
+local function main()
+    dbg(" Total %d devices need to delete info" % #arg)
+
+    -- if update.delete_table_record(arg) == false then
+    --  dbg("Error! delete_table_record " .. json.encode(arg))
+    -- end
+    -- if update.record_to_lookup_table() == false then
+    --  dbg("Error! record_to_lookup_table ")
+    -- end
+    local fp = io.open(MAX_RECORD, "r")
+    local max_record = {}
+    if fp == nil then
+        --dbg("error open file failed:" .. MAX_RECORD)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        max_record = json.decode(lines) or {}
+    end
+
+    local has_major_re = false
+    for i=1,#arg do
+        if is_major_re(arg[i]) then
+            has_major_re = true
+        end
+        if max_record[arg[i]] then
+            -- 新固件，仅记录离线，加入延迟删除列表，等待cpu空闲后删除
+            dbg("just delete record_devid, don't delete record until cpu idle")
+            if delete_record_devid(arg[i]) == false then
+                dbg("Error! delete_record_devid " .. json.encode(arg[i]))
+            end
+            save_to_delete_info({arg[i]})
+        else
+            -- 旧固件，删除所有组件协商信息，之后重新获取
+            if update.delete_table_record({arg[i]}) == false then
+                dbg("Error! delete_table_record " .. json.encode(arg[i]))
+            end
+        end
+    end
+    if has_major_re then
+       if update.record_to_lookup_table() == false then
+            dbg("Error! record_to_lookup_table ")
+            update.update_re_role_info()
+        end
+    end
+    update.clear_all_iot_config()
+
+    
+    --update.update_dev_list()
+    --update.update_role_info()
+end
+
+script.run(main)

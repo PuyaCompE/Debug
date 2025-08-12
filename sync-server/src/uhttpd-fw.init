@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+PROG=/usr/sbin/uhttpd
+
+start_service() {
+    mkdir -p /var/firmwares
+	mkdir -p /var/upgrade
+	
+    procd_open_instance
+    procd_set_param command "$PROG" -f -p 127.0.0.1:20003 -D -h /var/firmwares
+    procd_set_param respawn
+    procd_close_instance
+}

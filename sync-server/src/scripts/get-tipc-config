@@ -1,0 +1,24 @@
+#!/usr/bin/lua
+local RWLocker = require("luci.model.locker").RWLocker
+local locker = RWLocker("/tmp/tipc_config.lock")
+local ret = locker:tlock(true)
+if ret then
+	local dbg = require "luci.tools.debug"
+	local tipc_config = require "luci.model.tipc_config"
+	local sync = require "luci.model.sync"
+
+	local my_devid = sync.get_device_id()
+
+	while true do
+		tipc_config.del_node_addr(tostring(my_devid))
+		tipc_config.clear_tipc_request_flag()
+		if tipc_config.request_tipc_config() then
+			dbg("!!!!!!!!!!!!!!!!!!!!!!success to get tipc config!!!!!!!!!!!!!")
+	        os.execute("/etc/init.d/tipc-server reload &")
+	        locker:ulock()
+	        os.exit(0)
+	    else
+	    	os.execute("sleep 10")
+	    end
+	end
+end

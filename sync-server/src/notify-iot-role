@@ -1,0 +1,220 @@
+#!/usr/bin/lua
+--[[
+    This script is used to notify binded deco devices their iot role,
+    so that they can start or stop their iot modules/programs.
+
+    @param[in] iot_master_dev_id        -- device_id of the selected (wifi-)iot-master
+]]--
+
+local dbg   = require "luci.tools.debug"
+local json  = require "luci.json"
+local sys   = require "luci.sys"
+local ubus  = require "ubus"
+
+local IOT_ROLE_MASTER = "master"
+local IOT_ROLE_WIFI_MASTER = "wifi-master"
+local IOT_ROLE_DEVICE = "device"
+local IOT_ROLE_WIFI_DEVICE = "wifi-device"
+local OPCODE_IOT_WIFI = "0x4045"
+local OPCODE_IOT_MASTER = "0x4096"
+local RECORD_OP = "/var/run/record_op"
+local FLAG_FILE = "/tmp/notify_iot_role_flag"
+local RETRY_TIMES = 3
+local LOG_LEVEL_ERR = 3
+local LOG_LEVEL_INFO = 6
+
+local _ubus
+local my_timestamp
+local req_args = {}
+local data = {}
+
+local function log(msg)
+    dbg.print(msg)
+    local cmd = "logger -p 6 [notify-iot-role]'%s'" % {msg}
+    sys.exec(cmd)
+end
+
+local function err(msg)
+    dbg.print(msg)
+    local cmd = "logger -p 3 [notify-iot-role]'%s'" % {msg}
+    sys.exec(cmd)
+end
+
+local function decode_from_file(file)
+    local fp = io.open(file, "r")
+    local obj = nil
+    if fp == nil then
+        err("error open file failed:" .. file)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        obj = json.decode(lines)
+    end
+	return obj
+end
+
+local function check_newer_notice(my_timestamp)
+    local f = io.open(FLAG_FILE, "r")
+    if not f then
+        return false
+    end
+    local timestamp = f:read("*a")
+    f:close()
+
+    if not timestamp then
+        log("Empty flag file!")
+    end
+    timestamp = tonumber(timestamp)
+
+    return timestamp > my_timestamp
+end
+
+-- local function notify_myself_iot_role(is_master)
+--     return iot_device.inner_program_mgmt(is_master)
+-- end
+
+local function check_notify_result(res)
+    if res == nil or res.data == nil or res.success == nil then
+        return false
+    end
+    local success = res.success
+    local error_code = res.data.error_code
+    local msg = res.data.msg
+    if not success or error_code ~= 0 then
+        return false, msg
+    end
+
+    return true
+end
+
+local function notify_device_iot_role(dev_id, is_master)
+    local count = 0
+    local result
+    local success
+    local msg
+
+    if dev_id == nil then
+        err("fail to notify iot role as bad dev_id")
+        return false
+    end
+    log("===target device_id: " .. dev_id)
+    log("(wifi) iot master: " .. tostring(is_master))
+
+    while count < RETRY_TIMES do
+        req_args.target_id = dev_id
+        req_args.data.params.is_master = is_master
+        result = _ubus:call("sync", "request", req_args)
+        log("notify result: " .. json.encode(result))
+
+        success, msg = check_notify_result(result)
+        if success then
+            log("succeed to notify")
+            break
+        else
+            msg = msg and msg or "unsupport or other unknown reason"
+            err("fail to notify: " .. msg)
+            count = count + 1
+            sys.fork_call("sleep 2")
+        end
+    end
+
+    return success
+end
+
+
+-- function main()
+log("========== start")
+local record_op = nil
+local iot_master_dev_id = nil
+local iot_dev_id_list = nil
+local wifi_iot_dev_id_list = nil
+local dev_id_list = {}
+
+if arg[1] == nil then
+    err("invalid arg")
+    return false, "invalid arg"
+end
+iot_master_dev_id = arg[1]
+log("iot_master_dev_id: " .. iot_master_dev_id)
+
+-- get dev_id_list
+record_op = decode_from_file(RECORD_OP)
+if record_op then
+    iot_dev_id_list = record_op[OPCODE_IOT_MASTER]
+    wifi_iot_dev_id_list = record_op[OPCODE_IOT_WIFI]
+end
+if wifi_iot_dev_id_list and #wifi_iot_dev_id_list > 0 then
+    log("wifi iot device: " .. json.encode(wifi_iot_dev_id_list))
+    for _, dev_id in ipairs(wifi_iot_dev_id_list) do
+        local is_new = true
+        for _, _dev_id in ipairs(dev_id_list) do
+            if dev_id == _dev_id then
+                is_new = false
+            end
+        end
+        if is_new and dev_id ~= iot_master_dev_id then
+            table.insert(dev_id_list, dev_id)
+        end
+    end
+end
+if iot_dev_id_list and #iot_dev_id_list > 0 then
+    log("iot device: " .. json.encode(iot_dev_id_list))
+    for _, dev_id in ipairs(iot_dev_id_list) do
+        local is_new = true
+        for _, _dev_id in ipairs(dev_id_list) do
+            if dev_id == _dev_id then
+                is_new = false
+            end
+        end
+        if is_new and dev_id ~= iot_master_dev_id then
+            table.insert(dev_id_list, dev_id)
+        end
+    end
+end
+
+-- check timestamp flag
+my_timestamp = os.time()
+if check_newer_notice(my_timestamp) then
+    return false, "iot role has been updated"
+end
+local f = io.open(FLAG_FILE, "w")
+if not f then
+    err("Fail to write flag file!")
+    return false
+end
+f:write(tostring(os.time()))
+f:close()
+
+-- prepare fixed data
+data.params = {}
+data.params.is_master = false
+req_args.data = data
+req_args.opcode = "0xc459" -- opcode IOT_ROLE_INNER_PROG_MGMT
+req_args.include_myself = true
+-- req_args.target_type = "RE"
+_ubus = ubus.connect()
+if _ubus == nil then
+    err("Fail to prepare!")
+    return false
+end
+
+-- notify (wifi) iot master to start iot programs
+log("=== notify to start")
+notify_device_iot_role(iot_master_dev_id, true)
+
+-- notify other iot devices to stop iot programs
+log("=== notify to stop")
+log("dev_id_list: " .. json.encode(dev_id_list))
+if #dev_id_list > 0 then
+    for _, dev_id in ipairs(dev_id_list) do
+        if check_newer_notice(my_timestamp) then
+            err("iot role is updated, exit")
+            _ubus:close()
+            return false, "iot role is updated"
+        end
+        notify_device_iot_role(dev_id, false)
+    end
+end
+
+_ubus:close()
+return true

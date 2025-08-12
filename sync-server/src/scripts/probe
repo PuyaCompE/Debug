@@ -1,0 +1,1538 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local util = require "luci.util"
+local dbg = require "luci.tools.debug"
+local nw = require "luci.model.network"
+local sync = require "luci.model.sync"
+local nixio = require "nixio"
+local sys    = require "luci.sys"
+local fs = require "nixio.fs"
+local subprocess = require "luci.model.subprocess"
+local script = require "sync-script"
+local status = require "luci.tools.status"
+local quick_setup = require "luci.controller.admin.mobile_app.quick_setup"
+local appcloud = require "luci.model.app_cloudfirm"
+local deco_iface = require "deco_on_off_iface"
+local mode = require "luci.model.mode"
+local flag_util = require "luci.tools.probe_data"
+local bit  = require "bit"
+local ubus = require("ubus")
+
+require "luci.ip"
+
+local safe_mem = 10 * 1024
+
+local die = script.die
+local finalize = script.finalize
+
+local infile = arg[1]
+local outfile = arg[2]
+
+local INIT_COUNTDOWN = 4
+local PROBE_INTERVAL = 5
+local ERR_MAX_LOOP = 3
+local INACTIVE_STATE_FILE = "/var/run/inactive-state"
+local DHCP_RESERVATION_FILE = "/tmp/udhcpd.conf"
+local RECORD_DEVID = "/var/run/record_devid"
+local AWN_CHANNEL_SWITCH_STATE_FILE = "/var/run/awn_switch_channel"
+
+script.outfile = outfile
+
+local function qs_write(qs_form)
+    local qsmod = "luci.controller.admin.mobile_app." .. qs_form.module
+
+    local res = require(qsmod).dispatch(qs_form)
+    
+    return res
+end
+
+local function set_guest_mix( value )
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    local is_mix_str = uci_s:get("wifi", "guest", "mix") or "0"
+    local is_mix = tonumber(is_mix_str)
+    local enable_str = uci_s:get("wifi", "guest", "enable") or "0"
+    local enable = tonumber(enable_str)
+    local role = sync.get_role()
+
+    if value == true and is_mix == 0 then
+        uci_s:revert("wifi", "guest", "mix" )
+        uci_s:set("wifi", "guest", "mix", "1")
+        uci_s:save("wifi")
+        if enable == 1 and role == "RE" then
+            dbg("DECO RE in mix network, guest network mix")
+            subprocess.exec({"/etc/init.d/repacd", "restart"})
+        end
+    elseif value == false and is_mix == 1 then
+        uci_s:revert("wifi", "guest", "mix" )
+        uci_s:save("wifi")
+        if enable == 0 and role == "RE" then
+            dbg("DECO RE in signal network, guest network revert")
+            subprocess.exec({"/etc/init.d/repacd", "restart"})
+        end
+    end
+
+end
+
+local function clear_account_temp()
+    local uci = require "luci.model.uci"
+    local uci_r    = uci.cursor()
+    local need_bind = uci_r:get("cloud_config", "device_status", "need_bind")
+    local bind_status = uci_r:get("cloud_config", "device_status", "bind_status")
+
+    local role = sync.get_role()
+    if "AP" == role then
+        dbg.print("AP role, try to clear account")
+        local pack = sync.get_preconf_pack() or 0
+        local preconf_id = sync.get_pregroup_crc32_hex()
+        pack = tonumber(pack)
+        local num = sync.get_bind_num_by_preconf_id(preconf_id)
+
+        dbg.print("pack is" .. tostring(pack) .. "bind num is" .. tostring(num))
+        if num >= pack then
+            if tonumber(need_bind) == 0 and tonumber(bind_status) == 1 then
+                dbg.print("device has been bind to cloud, clear account")
+                uci_r:delete("cloud_config","device_status","username")
+                uci_r:delete("cloud_config","device_status","password")
+                uci_r:rawcommit("cloud_config")
+            end
+        end
+    end
+
+end
+
+
+local function _activate(act)
+    dbg("State =>", act and "active" or "inactive")
+    if act then
+        fs.unlink(INACTIVE_STATE_FILE)
+    else
+        local f = io.open(INACTIVE_STATE_FILE, "w")
+        f:close()
+    end
+
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    uci_s:set("wifi", "ap", "enable", act and "1" or "0")
+    uci_s:save("wifi")
+
+    subprocess.exec({"/etc/init.d/repacd", "restart"})
+end
+
+local function activate()
+    return _activate(true)
+end
+
+local function inactivate()
+    return _activate(false)
+end
+
+local function chanlimit_is_chan_allowed_5g(channum, cl_5g_start_chan, cl_5g_end_chan)
+    local is_allow = true
+    if cl_5g_start_chan ~= 0 and cl_5g_end_chan ~= 0 and channum >= 36 and channum <= 177 then
+        if channum < cl_5g_start_chan or channum > cl_5g_end_chan then
+            dbg.print("Channel Limit: 5G channel " .. tostring(channum) .. " is not allow!")
+            dbg.print("limit: " .. tostring(cl_5g_start_chan) .. "-" .. tostring(cl_5g_end_chan))
+            is_allow = false
+        end
+    end
+
+    return is_allow
+end
+
+local function set_channel(channel)
+    local wireless = require "luci.model.wireless_common"
+    local uci = require "luci.model.uci"
+    local mode = require "luci.model.mode"
+    local uci_s = uci.cursor_state()
+
+    local channel_2g = channel._2g or '0'
+    local channel_5g = channel._5g or '0'
+    local channel_5g_2 = channel._5g2 or '0'
+    local channel_6g = channel._6g or '0'
+    local channel_6g_2 = channel._6g2 or '0'
+
+    local cur_chan_5g = uci_s:get("wifi", "radio_5g", "channel")
+    local cur_chan_5g_2 = uci_s:get("wifi", "radio_5g_2", "channel")
+    local cur_chan_2g = uci_s:get("wifi", "radio_2g", "channel")
+    local cur_chan_6g = uci_s:get("wifi", "radio_6g", "channel")
+    local cur_chan_6g_2 = uci_s:get("ext_wifi", "radio_6g_2", "channel")
+
+    local special_id = sys.exec("getfirm SPECIAL_ID | tr -d \"\\n\"")
+    local uci_p= uci.cursor("/etc/profile.d")
+
+    local channel_limit_support = uci_p:get("channel_limit", "radio_5g", "support") or "no"
+    local channel_limit = uci_s:get("band_limit", "outdoor", "channellimit")
+    local cl_5g_start_chan = 0
+    local cl_5g_end_chan = 0
+
+    local support_band_6g = mode.is_band_6g_support()
+    local support_tri_band = mode.is_tri_band_support()
+    local support_band_6g_2 = mode.is_band_6g2_support()
+    local support_band_5g_2 = mode.is_band_5g2_support()
+
+    local channel_6g_change = false
+    local channel_5g2_change = false
+    local channel_6g2_change = false
+
+    if support_band_6g_2 == true then
+        if cur_chan_6g_2 and cur_chan_6g_2 ~= channel_6g_2 and channel_6g_2 ~= "0" then
+            channel_6g2_change = true
+        end
+    end
+
+    if support_band_6g == true then
+        if cur_chan_6g and cur_chan_6g ~= channel_6g and channel_6g ~= "0" then
+            channel_6g_change = true
+        end
+    end
+
+    if support_band_5g_2 == true then
+        if cur_chan_5g_2 and cur_chan_5g_2 ~= channel_5g_2 and channel_5g_2 ~= "0" then
+            channel_5g2_change = true
+        end
+    end
+
+    if channel_limit_support == "yes" then
+        cl_5g_start_chan = tonumber(uci_p:get("channel_limit", "radio_5g", "start_channel") or "0")
+        cl_5g_end_chan = tonumber(uci_p:get("channel_limit", "radio_5g", "end_channel") or "0")
+    end
+
+    local channel_limited_state_5g = channel_limit_support == "yes" and channel_limit == "1" and special_id ~= "55530000" 
+        and (not chanlimit_is_chan_allowed_5g(tonumber(channel_5g), cl_5g_start_chan, cl_5g_end_chan))
+
+    -- Return directly if working channel of every band is the same.
+    if (cur_chan_5g and cur_chan_5g == channel_5g) or channel_limited_state_5g then
+        if cur_chan_2g and cur_chan_2g == channel_2g then
+            if channel_6g_change == false and channel_5g2_change == false and channel_6g2_change == false then
+                if channel_limited_state_5g then
+                    dbg.print("Channel Limit: skip not allowed channel 5g sync: " .. tostring(channel_5g))
+                end
+                return
+            end
+        end
+    end
+
+    if fs.access(AWN_CHANNEL_SWITCH_STATE_FILE) then
+        dbg("Warning:awn switching channel, do not sync channel")
+        return
+    end
+
+    local ext_channel_changed = false
+    if fs.access(AWN_CHANNEL_SWITCH_STATE_FILE) then
+        dbg("Warning:awn switching channel, do not sync channel")
+        return
+    end
+
+    local channel_changed = false
+
+    if support_band_6g_2 == true then
+        if channel_6g_2 and channel_6g_2 ~= "0" then
+            local channel_support = wireless.is_channel_support_6G2(channel_6g_2)
+            if not channel_support then
+                dbg("Warning:channel_6g_2 " .. channel_6g_2 .. " isn't support")
+            else
+                dbg("Setting radio_6g_2 channel to " .. channel_6g_2)
+                uci_s:revert("ext_wifi", "radio_6g_2", "channel")
+                uci_s:set("ext_wifi", "radio_6g_2", "channel", channel_6g_2)
+                ext_channel_changed = true
+            end
+        end
+    end
+
+    if support_band_6g == true then
+        if channel_6g and channel_6g ~= "0" then
+            local channel_support = wireless.is_channel_support_6G(channel_6g)
+            if not channel_support then
+                dbg("Warning:channel_6g " .. channel_6g .. " isn't support")
+            else
+                dbg("Setting radio_6g channel to " .. channel_6g)
+                uci_s:revert("wifi", "radio_6g", "channel")
+                uci_s:set("wifi", "radio_6g", "channel", channel_6g)
+                channel_changed = true
+            end
+        end
+    end
+
+    if support_band_5g_2 == true then
+        if channel_5g_2 and channel_5g_2 ~= "0" then
+            local channel_support = wireless.is_channel_support_5G2(channel_5g_2)
+            if not channel_support then
+                dbg("Warning:channel_5g_2 " .. channel_5g_2 .. " isn't support")
+            else
+                dbg("Setting radio_5g_2 channel to " .. channel_5g_2);
+                uci_s:revert("wifi", "radio_5g_2", "channel")
+                uci_s:set("wifi", "radio_5g_2", "channel", channel_5g_2)
+                channel_changed = true
+            end
+        end
+    end
+
+    if channel_5g and channel_5g ~= "0" then
+        local channel_support = wireless.is_channel_support_5G(channel_5g)
+        if not channel_support then
+            dbg("Warning:channel_5g " .. channel_5g .. " isn't support")
+        else
+            if channel_limited_state_5g then
+                dbg("Channel Limit: Outdoor only work in band3 or band4")
+                uci_s:revert("wifi", "radio_5g", "channel")
+                uci_s:set("wifi", "radio_5g", "channel", "0")
+            else
+                dbg("Setting radio_5g channel to " .. channel_5g);
+                uci_s:revert("wifi", "radio_5g", "channel")
+                uci_s:set("wifi", "radio_5g", "channel", channel_5g)
+                channel_changed = true
+            end
+        end
+    end
+    if channel_2g and channel_2g ~= "0" then
+        local channel_support = wireless.is_channel_support_2G(channel_2g)
+        if not channel_support then
+            dbg("Warning:channel_2g " .. channel_2g .. " isn't support")
+        else
+            dbg("Setting radio_2g channel to " .. channel_2g);
+            uci_s:revert("wifi", "radio_2g", "channel")
+            uci_s:set("wifi", "radio_2g", "channel", channel_2g)
+            channel_changed = true
+        end
+    end
+
+    if channel_changed == true or ext_channel_changed == true then
+        if channel_changed == true then
+            uci_s:save("wifi")
+        end
+        if ext_channel_changed == true then
+            uci_s:save("ext_wifi")
+        end
+        subprocess.exec({"/etc/init.d/repacd", "restart"})
+    end
+end
+
+local function read_dhcp_reservations()
+    local f = io.open(DHCP_RESERVATION_FILE, "r")
+    if not f then
+        return nil
+    end
+    local buf = f:read("*a")
+    f:close()
+
+    local res = {}
+    for mac, ip in buf:gmatch("static_lease%s+([:%x]+)%s+([%.%d]+)") do
+        res[mac:lower()] = luci.ip.IPv4(ip)
+    end
+
+    return res
+end
+
+local dhcp_reservations = nil
+local function add_dhcp_reservation_maybe(dev)
+    dhcp_reservations = dhcp_researvations or read_dhcp_reservations()
+    if not dhcp_reservations then
+        return
+    end
+
+    local mac = dev.mac:lower()
+    local ip = dev.ip
+    if not dhcp_reservations[mac] then
+        -- Add a new entry.
+        local f = io.open(DHCP_RESERVATION_FILE, "a")
+        f:write("static_lease", " ", mac, " ", ip, "\n")
+        f:close()
+    elseif dhcp_reservations[mac] ~= luci.ip.IPv4(ip) then
+        -- Alter existing entry.
+        local f = io.open(DHCP_RESERVATION_FILE, "r")
+        local buf = f:read("*a")
+        f:close()
+
+        buf = buf:gsub("static_lease%s+([:%x]+)%s+([%.%d]+)", function(m, i)
+                           if m:lower() == mac then
+                               return table.concat({"static_lease", mac, ip}, " ")
+                           else
+                               return false
+                           end
+        end)
+
+        local f = io.open(DHCP_RESERVATION_FILE, "w")
+        f:write(buf)
+        f:close()
+    end
+end
+
+local function is_enable_tmp_security()
+    if fs.access("/tmp/deco_dev") then
+        return true
+    end
+
+    return false
+end
+
+function is_in_dev_list(devid, devlist)
+    for device_id, __ in pairs(devlist) do
+        if devid == device_id then
+            --dbg(devid.." is in devlist")
+            return true
+        end
+    end
+       
+    dbg(devid.." is NOT in devlist")
+    return false 
+end
+
+local function is_in_record(devid)
+    if devid == nil then
+        dbg("is_in_record: devid is nil, return false")
+        return false
+    end
+    local fp = io.open(RECORD_DEVID, "r")
+
+    if fp == nil then
+        dbg("error open file failed:" .. RECORD_DEVID)
+        return false
+    end
+
+    local lines = fp:read("*all")
+    fp:close()
+    local record_devid = json.decode(lines)
+    if record_devid == nil then
+        dbg("is_in_record: record_devid is nil, return false")
+        return false
+    end
+
+    for i=1,#record_devid do
+        if record_devid[i] == devid then
+            --dbg(devid .." is in record_devid")
+            return true
+        end
+    end
+
+    --dbg(devid .." is not in record_devid")
+    return false
+end
+
+--AP onboarding, just handle UNBIND device, ignore RE
+local function onboarding_devlist_age(devlist)
+    for k, v in pairs(devlist) do
+        if v.role ~= "RE" then
+            v.countdown = v.countdown - 1
+            if v.countdown <= 0 then
+                devlist[k] = nil
+            end
+        end
+    end
+
+    return devlist
+end
+
+local function devlist_age(devlist, delete_list)
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    local my_mode = uci_s:get("repacd", "repacd", "DeviceType")
+    local offline_inform_list = {}
+    local list_is_empty = true
+
+    for k, v in pairs(devlist) do
+        v.countdown = v.countdown - 1
+        if v.countdown <= 0 then
+            offline_inform_list[#offline_inform_list+1] = k
+            list_is_empty = false
+            devlist[k] = nil
+            if my_mode == "AP" then
+                if is_in_record(k) == true then
+                    local my_devid = sync.get_device_id()
+                    if k == my_devid then
+                        dbg(k .. " is my devid(AP), don't put in to_delete_info list")
+                    else
+                        dbg("in record_devid, to_delete_info " .. k)
+                        delete_list[#delete_list + 1] = k
+                    end
+                else
+                    dbg("not exist in record_devid, don't delete " .. k)
+                end
+            end
+        end
+    end
+
+    if list_is_empty == false then
+        dbg("offline_inform_list"..json.encode(offline_inform_list))
+        deco_iface.inform_offline_event_to_all(offline_inform_list)
+    end
+
+    return devlist
+end
+
+local function devlist_to_iplist(devlist)
+    local iplist = {}
+    for k, v in pairs(devlist) do
+        local ip = luci.ip.IPv4(v.ip):string()
+        --assert(iplist[ip] == nil)
+        if iplist[ip] ~= nil then
+        iplist[ip] = k
+        end
+    end
+    return iplist
+end
+
+local function generate_preconf_nickname(mac)
+    local nickname = {}
+    local name = "Deco"
+    local name_base64
+
+
+    if mac then
+        local tmp_mac = (mac):gsub(":", "-"):upper()
+        local mac_sub = util.split(tmp_mac,"-")
+        if mac_sub[5] and mac_sub[6] then
+            name = "Deco_" .. tostring(mac_sub[5]) .. tostring(mac_sub[6]) 
+        end
+    end
+    name_base64 = nixio.bin.b64encode(name)
+
+    nickname.nickname = "custom"
+    nickname.custom_nickname = name_base64
+
+    return nickname
+end
+
+local function preconf_add_re_prv(devid, mac, nickname)
+
+    local params = {}
+    local form = {}
+    local device = {
+        device_id = devid,
+        mac = mac,
+        nickname = nickname
+    }
+
+    params.device = device
+
+    dbg.print("!!!!!!params = " .. json.encode(params))
+    form.form = "preconf"
+    form.operation = "preconf_add"
+    form.params = params
+    local ret = quick_setup.dispatch(form)
+    --dbg.print("add_prv result:" .. tostring(ret))
+    --dbg.print("add_prv result:" .. json.encode(ret))
+    if ret and ret.error_code == 0 then
+        clear_account_temp()
+    end
+end
+
+
+local function read_from_json_file(file)
+    local fp = io.open(file, "r")
+    local data = nil
+    if fp == nil then
+        dbg("error open file failed:" .. file)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        data = json.decode(lines)
+    end
+    return data
+end
+local function gen_session_id()
+    math.randomseed(os.time())
+    local val = math.random(1, 1000)
+    return val
+end
+
+local function sync_master_check_request()
+    local ERR_MAX_LOOP_DCMP = 6
+    local dftgroup = sync.read_dft_group_info()
+    local cfggroup = sync.read_group_info()
+
+    local tdpcli = tmpv2.tdp_client(ipaddr)
+
+    local my_role = sync.get_role()
+    local my_devid = sync.get_device_id()
+    
+    local nw = nw.init()
+    local net = nw:get_network("lan") or die("no network")
+    local my_ip_s = net:ipaddr()
+    my_ip_s = subprocess.call_output({"ifconfig", "br-lan"}):match("inet addr:([%d%.]+)")
+    if not my_ip_s then
+        dbg("Warning: I have no IP")
+        finalize{success = 0}
+        return false
+    end
+    local ifc = net:get_interface()
+    local ipaddr = ifc:ipaddrs()
+    ipaddr = #ipaddr > 0 and ipaddr[1] or die("no ip address")
+    ipaddr = ipaddr:broadcast():string()
+
+    local tdpcli = tmpv2.tdp_client(ipaddr)
+    tdpcli:set_timeout(5)
+    if my_role == "UNBIND" and not cfggroup.gid then
+        local master_check_request = {}
+        local master_check_response = {}
+        local my_devid_md5 = subprocess.call_output({"md5sum"}, my_devid):match("%x+")
+        local mac = (sync.getfirm_cached("MAC")):gsub("-", ":")
+        local mac_2_4G = subprocess.call_output({"ifconfig", "ath03"}):match("Link encap:Ethernet  HWaddr ([%S+]+)")
+        local mac_5G = subprocess.call_output({"ifconfig", "ath13"}):match("Link encap:Ethernet  HWaddr ([%S+]+)")
+        master_check_request.mac = mac
+        master_check_request.mac_2_4G = mac_2_4G
+        master_check_request.mac_5G = mac_5G
+        master_check_request.session_id  = gen_session_id()
+        master_check_request.device_id_md5 = my_devid_md5
+        local uuid = require "luci.model.uuid"
+        local string_code_re = uuid.generate_random()
+        master_check_request.string_code_re = sync.encrypt_table(string_code_re, my_devid)
+        master_check_request.ip = my_ip_s
+        dbg.print("<pre-config>master_check_request:"..json.encode(master_check_request))
+        local send_result, msg = tdpcli:send_request("SYNC_MASTER_CHECK",
+                                      json.encode{
+                                          params = {
+                                              group_hid = nixio.bin.crc32(dftgroup.gid),
+                                              secret = sync.encrypt_table(master_check_request,
+                                                                          dftgroup.key)
+                                          }
+                                      }
+        )
+
+        if not send_result then
+            die(msg)
+        end
+
+        local errcnt = 0
+        while true do
+            local master_check_response, msg = tdpcli:recv_reply(0xd402)
+            if not master_check_response then
+                if msg == "timeout" then
+                    break
+                end
+                errcnt = errcnt + 1
+                dbg("tdpcli recv error")
+                if errcnt > ERR_MAX_LOOP_DCMP then 
+                    die(msg)
+                end
+            end
+
+            local result = {}
+            if master_check_response then
+                --dbg.print("<pre-config>master_check_response:"..json.encode(master_check_response))
+                master_check_response = json.decode(master_check_response)
+                if master_check_response.error_code ~= 0 then
+                    -- Ignore error for group id being mismatched.
+                    if master_check_response.error_code ~= -3000 then
+                        dbg("Warning:", master_check_response.msg)
+                    end
+                end
+
+                local encryresult = master_check_response.result
+                if master_check_response.error_code == 0 and encryresult then
+                    result = sync.decrypt_table(encryresult.secret, dftgroup.key)
+                    dbg.print("<pre-config>master_check_response result:"..json.encode(result)) 
+                end
+
+                if result and
+                    result.session_id == master_check_request.session_id and
+                    result.string_code_re and string_code_re == result.string_code_re then
+                    tdpcli:close() 
+                    return true
+                end
+            end      
+        end
+    end
+    tdpcli:close()
+
+    return false
+end
+
+local function get_onboarding_status()
+    local ret = false
+    local ONBOARDING_FILE = "/tmp/onboarding"
+    local fp
+    local value
+
+    if fs.access(ONBOARDING_FILE) then
+        fp = io.open(ONBOARDING_FILE, "r")
+        if not fp then
+            dbg("open onboarding file with unexpect error")
+            return ret
+        end
+        value = fp:read("*line")
+        fp:close()
+        if value and tostring(value) == "1" then
+            ret = true
+        end
+    end
+
+    return ret
+end
+
+local function read_from_json_file(file)
+    local fp = io.open(file, "r")
+    local data = nil
+    if fp == nil then
+        dbg("error open file failed:" .. file)
+    else
+        local lines = fp:read("*all")
+        fp:close()
+        data = json.decode(lines)
+    end
+    return data
+end
+
+local function main()
+    assert(infile and outfile, "invalid arguments")
+    -- if less memory, do not probe
+    local model = require "luci.model.mode"
+    local sys_cmd = require "luci.sys"
+    local upgrade_type = model.upgrade_type_get()
+    local is_mobile_device = model.is_mobile_device()
+    if is_mobile_device == true and upgrade_type ~= nil and upgrade_type == "mobile_mount" then
+        if not fs.access("/tmp/firmware_upgrade_flag") and model.is_mem_protect_support() == true then
+            local memfree = status.get_memfree()
+            if tonumber(memfree) < safe_mem then
+                dbg("probe Warning: memory less than 15M 1 time")
+                sys_cmd.call("echo 3 > /proc/sys/vm/drop_caches")
+                sys_cmd.call("sleep 1")
+                memfree = status.get_memfree()
+                if tonumber(memfree) < safe_mem then
+                    dbg("probe Warning: memory less than 15M 2 times")
+                    finalize{success = 0}
+                    return
+                end
+            end
+        end
+    else
+        if model.is_mem_protect_support() == true then
+
+            local memfree = status.get_memfree()
+
+            if tonumber(memfree) < safe_mem then
+                dbg("Warning: less memory")
+                finalize{success = 0}
+                return
+            end
+        end
+    end
+    
+    local old_devlist = infile == "-" and {} or script.read_infile(infile)
+    to_delete_info = {}
+    if sync.get_onboarding_status() then
+        dbg("\n\nsend onboarding probe")
+        old_devlist = onboarding_devlist_age(old_devlist)
+    else
+        old_devlist = devlist_age(old_devlist, to_delete_info)
+    end
+    local iplist = devlist_to_iplist(old_devlist)
+
+    local group
+    local cfggroup = sync.read_group_info()
+    local dftgroup = sync.read_dft_group_info()
+    if not dftgroup.gid then
+        die("no default gid")
+    end
+    if cfggroup.gid then
+        group = cfggroup
+    else
+        group = dftgroup
+    end
+
+    local sync_ver = sync.get_sync_version()
+    assert(sync_ver)
+
+    local eth_backhual = sync.get_eth_link_status()
+    local preconf_id = sync.get_pregroup_crc32_hex()
+    local iptv_extend = sync.get_iptv_extend()
+    local guest_ver = sync.get_guest_ver()
+    local cfg_ver = sync.get_config_version()
+    local fw_ver = sync.get_firmware_version()
+    local dev_model = sync.getfirm_cached("MODEL")
+
+    local my_role = sync.get_role()
+    local my_devid = sync.get_device_id()
+    local my_state = fs.access(INACTIVE_STATE_FILE) and "inactive" or "active"
+    local uci = require "luci.model.uci"
+    local uci_s = uci.cursor_state()
+    local my_mode = uci_s:get("repacd", "repacd", "DeviceType")
+
+    if my_role == "AP" and my_state == "inactive" then
+        activate()
+    end
+
+    local nw = nw.init()
+    local net = nw:get_network("lan") or die("no network")
+    --local my_ip_s = net:ipaddr()
+    -- TODO: Remove later.
+    local my_ip_s = subprocess.call_output({"ifconfig", "br-lan"}):match("inet addr:([%d%.]+)")
+
+    if not my_ip_s then
+        dbg("Warning: I have no IP")
+        finalize{success = 0}
+        return
+    end
+
+    --local ifc = net:get_interface()
+    --local mac = ifc:mac()
+    local sys    = require "luci.sys"
+    local mac = ((sys.exec("getfirm MAC")):trim():gsub("-", ":"):upper())
+
+    local AP_IP_s = my_ip_s:match("(%d+%.%d+%.%d+)%.%d+")
+    if not AP_IP_s then
+        dbg("Warning: I have bad IP", my_ip_s)
+        finalize{success = 0}
+        return
+    end
+
+    -- local AP_IP = luci.ip.IPv4(AP_IP_s .. ".1")
+
+    local my_ip = luci.ip.IPv4(my_ip_s)
+
+    -- if my_role == "AP" and my_ip ~= AP_IP then
+    --     dbg("Warning: I am AP but my IP is not " .. AP_IP:string())
+    --     finalize{success = 0}
+    --     return
+    -- elseif my_role == "RE" and my_ip == AP_IP then
+    --     dbg("Warning: I am RE but my IP is " .. AP_IP:string())
+    --     finalize{success = 0}
+    --     return
+    -- end
+
+    local chan_2g = "0"
+    local chan_5g = "0"
+    --local chan_5g2
+    --local chan_6g
+    --local chan_6g2
+    local wireless = require "luci.model.wireless_common"
+    local channel = wireless.get_channel()
+    if not channel['2g'] and not channel['5g'] then
+        dbg("Warning: Fail to get channel")
+    else
+        chan_2g = channel["2g"]
+        chan_5g = channel["5g"]
+        chan_5g2 = channel["5g_2"]
+        chan_6g = channel["6g"]
+        -- chan_6g2 = channel["6g_2"]
+    end
+
+    -- local appWifi = require("luci.model.app_wifi").Wifi()
+    -- local signal = appWifi:get_signal_level()
+
+    local uci_r    = uci.cursor()
+    local ifc = net:get_interface()
+    --local ipaddr = ifc:ipaddrs()
+    --ipaddr = #ipaddr > 0 and ipaddr[1] or die("no ip address")
+    --ipaddr = ipaddr:broadcast():string()
+    local ipaddr = subprocess.call_output({"ifconfig", "br-lan"}):match("Bcast:([%d%.]+)")
+
+    if not ipaddr then
+        dbg("Warning: I have no Bcast IP")
+        finalize{success = 0}
+        return
+    end
+
+    local qs_ver
+    local sysmode = uci_s:get("sysmode", "sysmode", "mode")
+    local uci_p= uci.cursor("/etc/profile.d")
+    if sysmode == "AP" then
+        qs_ver = uci_p:get("component-ap-owner","list","quick_setup")
+    else
+        qs_ver = uci_p:get("component-router-owner","list","quick_setup")
+    end  
+
+    local _ubus = ubus.connect()
+    local req = {}
+    local preconfig_vap_state = {}
+    if not cfggroup.gid then
+        --enter pre-config check logic
+        local pre_config_support = uci_r:get_profile("dcmp", "pre_config_support") or "no"
+        if pre_config_support == "yes" then
+            if _ubus == nil then
+                dbg.print("_ubus is nil")
+                _ubus = ubus.connect()
+            end
+            req.operation = 1
+            preconfig_vap_state = _ubus:call("awn","preconfig",req)
+            if preconfig_vap_state and preconfig_vap_state.link_state == 1 and preconfig_vap_state.link_type == 1 then
+                local sync_master_check_result = sync_master_check_request()
+                if sync_master_check_result == false then
+                    --disconnect from pre_config
+                    req = {}
+                    req.operation = 12
+                    _ubus:call("awn","preconfig",req)
+                    _ubus:close()
+                    return
+                end
+            end
+        end
+    end
+
+    local tdpcli = tmpv2.tdp_client(ipaddr)
+    tdpcli:set_timeout(5)
+
+    local data = {
+        device_id = my_devid,
+        device_model = dev_model,
+        group_id = group.gid,
+        sync_version = sync_ver,
+        eth_backhual = eth_backhual,
+        -- pid is short for preconf_id in sync list
+        pid = preconf_id,
+        iptv_extend = iptv_extend,
+        guest_ver = guest_ver,
+        config_version = cfg_ver,
+        firmware_ver = fw_ver,
+        oemid = sync.getfirm_cached("OEM_ID"),
+        hwid = sync.getfirm_cached("HW_ID"),         
+        role = my_role,
+        ip = my_ip_s,
+        mac = mac,
+        channel_2g = chan_2g,
+        channel_5g = chan_5g,
+        --channel_5g_2 = chan_5g2,
+        --channel_6g = chan_6g,
+        --signal_level = signal,
+        need_account_digest = true,
+        qs_version = qs_ver,
+        tps = is_enable_tmp_security() and "1" or nil,
+        oversized_firmware = model.is_oversized_firmware(),
+        oui_version = model.get_oui_version(),
+        mix = 0x00
+    }
+
+
+    local compress_probe_support = model.is_compress_probe_support()
+    if my_role == "AP" and sync.get_onboarding_status() and compress_probe_support then
+        data.probe_type = 2
+    end
+
+    if compress_probe_support then 
+        data.cm_ver = sync.get_client_mgmt_ver()
+        data.web_up_support = true
+        data.comp_ver = 1
+        flag_util.table_to_bit(data)
+        flag_util.Encode_data(data)
+    end
+
+    -- mix represets for multiple meanings 
+    -- first bit is used by ISP DCMP PRECONFIG
+    -- it represents for fap's preconfig vap state
+    
+    req = {}
+    preconfig_vap_state = {}
+    req.operation = 2
+    if _ubus == nil then
+        dbg.print("!! _ubus is nil, reconnect")
+        _ubus = ubus.connect()
+    end
+    preconfig_vap_state = _ubus:call("awn","preconfig",req)
+    _ubus:close()
+
+    if preconfig_vap_state and preconfig_vap_state.state == 1 then
+        -- set first bit = 1
+        if data and data.mix ~= nil then
+            data.mix = bit.bor(data.mix, bit.lshift(0x01,0))
+        else
+            data.mix = bit.bor(0, bit.lshift(0x01,0))
+        end
+    else
+        -- set first bit = 0
+        if data and  data.mix then 
+            data.mix = bit.band(data.mix, bit.bnot(bit.lshift(0x01,0)))
+        else
+            data.mix = bit.band(0, bit.bnot(bit.lshift(0x01,0)))
+        end
+    end
+
+    if model.get_performance_limited() then
+        data.performance_limited = true
+    end
+
+    local tipc_config = require "luci.model.tipc_config"
+    data.tipc = 0
+    if tipc_config.check_tipc_enable() then
+        data.tipc = tipc_config.get_tipc_id()
+        if compress_probe_support then
+            data.tipc_tfstats = sync.get_tipc_tfstats() or false
+        end
+    end
+
+    local tmp_port_ver = "v2"
+    local fp = io.open("/tmp/ssh_client_port", "r")
+
+    if fp then
+        local ssh_port = fp:read("*n")
+
+        if ssh_port == 22 then
+            tmp_port_ver = "v1"
+        end
+
+        fp:close()
+    end
+
+    -- check is probe data oversize
+    local secret_len = #sync.encrypt_table(data,group.key)
+    if secret_len > 940 then
+        dbg("probe secret len is large then 940, maybe oversized and can’t send, now len:", secret_len)
+    end
+
+    -- v2(默认值)，表示SSH加密方式去掉了不安全算法，并且group key已经是rsa 2048
+    -- v1, 表示SSH加密方式去掉了不安全算法，但有部分样机group key还没更新到rsa 2048 
+    --     FAP收到RE带的是v1的则同步2048 的group key,  可以很快恢复到v2.
+    --     v1的发送处理方式为: 检查到本机已绑定但缺失group key 2048则probe里带v1, 只有RE会进行，FAP如果缺失(旧固件升级到新版本)则会在启动时直接生成
+    --     v1的接收处理方式为: 写/tmp/ssh_client_sec为v1. dropbear重启，dropbear/libssh按照旧方式设置密钥交换算法，dropbear加载512 的rsa key. 
+    --                         FAP用update_groupkey同步2048 group key给RE.
+    -- v0, 网络中有旧设备，SSH加密方式和ssh pub key都需要兼容旧的
+    --     旧设备离线可以恢复到v2
+    --     v0的发送处理方式为: 检查到未绑定或者不缺失group key 2048，网络协商状态为v0, 则probe里带v0
+    --     v0的接收处理方式为: 只计了时间，没其它处理    
+    -- none(不带这个字段), 是旧设备
+    --     none的接收处理方式为: 写/tmp/ssh_client_sec为v0, dropbear重启，dropbear/libssh按照旧方式设置密钥交换算法，dropbear加载512 的rsa key.
+    -- 注: 这里的操作会有些不对成，比如v1主要是单机的状态，发送时只看自身group info，接受时因需要调整dropbear/libssh算法要写/temp/ssh_client_sec文件。
+    --     v0只是新固件且group key已经是2048的设备检测到网络中有旧设备时处于的状态，接收不用做什么处理，只是作为赞不进入v2的临时状态，需要处理的是收到none
+    --     类型的时候。   
+    local sv = "v2"
+    
+    -- 查看group info是否包含rsa key 2048，对于还未绑定状态则不用看rsa key 2048
+    if cfggroup.gid and cfggroup.key2048 == nil then
+        sv = "v1"
+    else
+        -- 查看当前整个网络协商的版本
+        local fp_1 = io.open("/tmp/ssh_client_sec", "r")
+        if fp_1 then
+            local ssh_sec = fp_1:read("*l")
+            if ssh_sec == "v0" then
+                sv = "v0"
+            end
+
+            fp_1:close()
+        end
+    end
+
+    -- check is probe data oversize
+    local secret_len = #sync.encrypt_table(data,group.key)
+    if secret_len > 940 then
+        dbg("probe secret len is large then 940, maybe oversized and can’t send, now len:", secret_len)
+    end
+
+    local data, msg = tdpcli:send_request("SYNC_CONFIG",
+                                          json.encode{
+                                              params = {
+                                                  group_hid = nixio.bin.crc32(group.gid),
+                                                  secret = sync.encrypt_table(data,
+                                                                              group.key),
+                                                  tmp_port_ver = tmp_port_ver,
+                                                  sv = sv
+                                              }
+                                          }
+    )
+    if not data then
+        die(msg)
+    end
+
+    -- TODO: update timeout each iteration to keep total timeout controllable.
+    -- TODO: collect reply packets first without further inspection??
+    local devlist = old_devlist
+    local to_update = {}
+    local to_remove = {}
+    local to_reset = {} 
+    local to_bind = {}        
+    local stop_update = false
+    local to_get_info = {}
+    local binding = false
+    local errcnt = 0
+    local is_guest_mix = false
+    local online_inform_list = {}
+    local list_is_empty = true
+    local to_get_sup_channel = {}
+    local record_channel = {}
+    if my_role == "AP" then
+        record_channel = read_from_json_file("/tmp/support_channel_record") or {}
+    end
+    while true do
+        local data, msg = tdpcli:recv_reply(0xc401)
+        if not data then
+            if msg == "timeout" then
+                break
+            end
+            -- errcnt = errcnt + 1
+            -- dbg("tdpcli recv error")
+            -- if errcnt > ERR_MAX_LOOP then              
+            --     die(msg)
+            -- end
+        end
+
+        local result = nil
+        if data then
+            binding = sync.get_binding_flag()
+
+            data = json.decode(data)
+            if data then
+                if data.error_code ~= 0 then
+                    -- Ignore error for group id being mismatched.
+                    if data.error_code ~= -3000 and data.error_code ~= -4000 then
+                        if data.msg then 
+				            if data.msg ~= "onboarding" then
+                                dbg("Warning:", json.encode(data.msg))
+                            end
+			            else
+				            dbg("Warning! No msg, error_code is %s" % json.encode(data.error_code))
+			            end
+                    end
+                end
+
+                local encryresult = data.result
+                if data.error_code == 0 and encryresult and encryresult.secret then
+                    result = sync.decrypt_table(encryresult.secret, group.key)
+                    if cfggroup.gid then
+                        if not result or type(result) ~= "table" or not result.group_id or result.group_id ~=cfggroup.gid then
+                            result = sync.decrypt_table(encryresult.secret, dftgroup.key)
+                        end
+                    end 
+                end
+            end
+        end
+
+        if result
+            and type(result) == "table"
+            and result.group_id
+            and result.config_version
+            and result.ip
+            and result.device_id
+            and result.firmware_ver
+        then
+            local devid = tostring(result.device_id)
+            -- pid is short for preconf_id in sync list
+            local dev_preconf = tostring(result.pid)
+            if not devlist[devid] or devlist[devid].countdown < INIT_COUNTDOWN or devlist[devid].role ~= result.role then
+                if compress_probe_support and result.fg then
+                    flag_util.Decode_data(result)
+                    flag_util.bit_to_table(result)
+                end
+                local dev = {
+                    role = result.role,
+                    ip = result.ip,
+                    eth_backhual = result.eth_backhual,
+                    extra_info = result.extra_info,
+                    preconf_id = result.pid,
+                    iptv_extend = result.iptv_extend,
+                    guest_ver = result.guest_ver,
+                    mac = result.mac,
+                    device_model = result.device_model,
+                    fw_version = result.firmware_ver,
+                    sync_version = result.sync_version,
+                    config_version = result.config_version,
+                    hwid = result.hwid,
+                    oemid = result.oemid,
+                    channel_2g = result.channel_2g,
+                    channel_5g = result.channel_5g,
+                    channel_5g_2 = result.channel_5g_2,
+                    channel_6g = result.channel_6g,
+                    channel_6g_2 = result.ch62,
+                    need_account_digest = result.need_account_digest,
+                    signal_level = result.signal_level,
+                    tipc = result.tipc,
+                    performance_limited = result.performance_limited,
+                    qs_version = result.qs_version,
+                    tps = result.tps,
+                    web_up_support = result.web_up_support,
+                    comp_ver = result.comp_ver,
+                    countdown = INIT_COUNTDOWN,                    
+                }
+
+                if result.mix == nil then
+                    -- set first bit = 0
+                    if data and data.mix ~= nil then
+                        dev.mix = bit.band(data.mix, bit.bnot(bit.lshift(0x01,0)))
+                    else
+                        dev.mix = bit.band(0, bit.bnot(bit.lshift(0x01,0)))
+                    end
+                else
+                    dev.mix = result.mix
+                end
+
+
+                if result.oversized_firmware == nil then
+                    dev.oversized_firmware = false
+                else
+                    dev.oversized_firmware = result.oversized_firmware
+                end
+                -- get dev's oui_version from respone. fill 0 for nil , otherwise copy it.
+                if result.oui_version == nil then
+                    dev.oui_version = "0"
+                else
+                    dev.oui_version = result.oui_version
+                end
+                if result.nickname_category then
+                    dev.nickname_category = result.nickname_category
+                end
+
+                if result.tipc_tfstats == nil then
+                    dev.tipc_tfstats = false
+                else
+                    dev.tipc_tfstats = result.tipc_tfstats
+                end
+                if result.cm_ver == nil then
+                    dev.cm_ver = 0
+                else
+                    dev.cm_ver = result.cm_ver
+                end
+
+                -- 不要填默认置，需要区分v0和不带这个字段
+                if result.sv then
+                    dev.sv =  result.sv
+                end
+
+                if result.tipc_tfstats == nil then
+                    dev.tipc_tfstats = false
+                else
+                    dev.tipc_tfstats = result.tipc_tfstats
+                end
+                if result.cm_ver == nil then
+                    dev.cm_ver = 0
+                else
+                    dev.cm_ver = result.cm_ver
+                end
+
+                local is_myself = my_devid == devid                
+                local is_bind = sync.is_bind_device(devid)
+                local is_bad_dev = false
+                if result.group_id == cfggroup.gid then
+                    if is_in_dev_list(devid, devlist) == false then
+                        online_inform_list[#online_inform_list+1] = devid
+                        list_is_empty = false
+                    end
+                    if not is_bind and not binding then
+                        if result.sync_version and sync.compare_sync_version(sync_ver, '1') > 0 then
+                            if my_role == "AP" and not is_myself and dev.role == "RE" then
+                                if sync_ver == result.sync_version then
+                                    dbg("Warning: Peer %s has same cfg gid but isn't bind, try to unbind" % {
+                                        tostring(devid)
+                                    })
+                                    to_reset[#to_reset+1] = devid
+                                elseif sync.compare_sync_version(sync_ver, result.sync_version) > 0 then
+                                    dbg("Warning: Peer %s has same cfg gid but isn't bind with lower sync version, try to bind" % {
+                                        tostring(devid)
+                                    })
+                                    to_bind[#to_bind+1] = devid                                    
+                                end
+                            else
+                                dbg("Warning: Peer %s has same cfg gid but isn't bind." % {
+                                    tostring(devid)
+                                })                           
+                            end
+                        else
+                            dbg("Warning: Peer %s has same cfg gid but isn't bind. Ignore it because of invaild sync version" % {
+                                tostring(devid)
+                            })                        
+                        end
+                    elseif is_bind and not binding and result.sync_version and sync.compare_sync_version(sync_ver, result.sync_version) > 0 then
+                        dbg("Warning: Peer %s has lower sync version, try to bind" % {
+                            tostring(devid)
+                        })
+                        to_bind[#to_bind+1] = devid                         
+                    end
+                    if not binding and
+                        my_role == "RE" and not is_myself and dev.role == "AP" and
+                        dev.tipc and tonumber(dev.tipc) ~= 0 and
+                        tipc_config.check_tipc_support() and
+                        not (tipc_config.check_tipc_enable() and
+                        tipc_config.get_tipc_id() == tonumber(dev.tipc) and tipc_config.is_linked_to_node())
+                        then
+                        dbg("Need check my tipc situation")
+                        os.execute("/lib/sync-server/scripts/get-tipc-config &")
+                    end
+                    local usb_sync = require "luci.model.usb_sync"
+                    local dev_usb_status = usb_sync.get_usb_status_by_devid(devid)
+                    if is_bind and not binding and my_role == "AP" and not is_myself and
+                        dev.role == "RE" and dev_usb_status then
+                        if dev_usb_status.ip ~= dev.ip then
+                            dev_usb_status.ip = dev.ip
+                            usb_sync.update_usb_status(devid, dev_usb_status)
+                        end
+                    end
+                    -- in mix network guest network not valid when DECO's role is RE.
+                    if is_bind and not binding and
+                        my_role == "RE" and not is_myself and not dev.guest_ver 
+                        then
+                            is_guest_mix = true
+                    end
+                elseif result.group_id == dftgroup.gid and dev_preconf == preconf_id and preconf_id ~= "" then
+                    --if not is_bind and not binding and
+                    if not binding and
+                        my_role == "AP" and not is_myself  then
+                        dbg("!!!!!!! unbind dev_id %s connect to AP %s, they has same preconf_id %s " % {
+                            tostring(devid), tostring(my_devid), tostring(preconf_id)
+                        })
+
+                        local nickname = {}
+                        local name = generate_preconf_nickname(result.mac)
+                        nickname.nickname = name.nickname
+                        nickname.custom_nickname = name.custom_nickname
+
+
+                        
+                        if get_onboarding_status() then
+                            dbg("in onboarding status, do not bind preconf device")
+                        else
+                            if sync.is_unbind_device_by_app(devid) then
+                                dbg("dev has been unbind by app, do not form preconf network !")
+                            else
+                                preconf_add_re_prv(devid, result.mac, nickname)
+                            end
+                        end
+                        
+                        preconf_add_re_prv(devid, result.mac, nickname)
+                    end
+
+                elseif is_bind and not binding then
+                    is_bind = false
+                    dbg("Warning: Peer %s is bind but has different gid." % {
+                        tostring(devid)
+                    })
+                    if my_role == "AP" and not is_myself then
+                        to_remove[#to_remove+1] = devid
+                        --sync.rm_bind_device(devid)
+                        dbg("Warning: Delete this peer form bind list.")                                           
+                    end
+
+                end
+                if result.group_id ~= cfggroup.gid and result.group_id ~= dftgroup.gid then
+                    is_bad_dev = true
+                    if devlist[devid] then
+                        devlist[devid] = nil
+                    end
+                end
+
+                local peer_ip = luci.ip.IPv4(dev.ip)
+                local is_bad_ip = (not is_myself and my_ip == peer_ip)
+                --    or (dev.role == "RE" and peer_ip == AP_IP)
+                --    or (dev.role == "AP" and peer_ip ~= AP_IP)
+                local my_channel = wireless.get_channel()
+
+                if is_bad_ip then
+                    dbg("Warning: Peer %s (%s) has bad IP %s. Ignored"
+                            % {tostring(dev_id), tostring(dev.role), tostring(dev.ip)})
+                end
+
+                if not is_bad_dev and not is_bad_ip then
+                    local ip = luci.ip.IPv4(dev.ip):string()
+                    if not iplist[ip]
+                        or devlist[iplist[ip]].countdown < dev.countdown
+                    then
+                        if iplist[ip] and iplist[ip] ~= devid then
+                            dbg("Kill aged device %s with same IP %s"
+                                    % {tostring(iplist[ip]), tostring(ip)})
+                            devlist[iplist[ip]] = nil
+                            if my_mode == "AP" then
+                                if is_in_record(iplist[ip]) == true then
+                                    dbg("in record_devid, to_delete_info " .. iplist[ip])
+                                    to_delete_info[#to_delete_info + 1] = iplist[ip]
+                                end
+                            end
+                        end
+
+                        iplist[ip] = devid
+
+                        if my_role == "UNBIND" then
+                            if is_myself and is_in_record(devid) == false then
+                                dbg("to_get_info myself")
+                                to_get_info[#to_get_info+1] = dev.ip
+                                to_get_info[#to_get_info+1] = "0"
+                            end
+                        elseif my_mode == "AP" then
+                            if sync.compare_sync_version(dev.sync_version, sync_ver) == 0 then
+                                if dev.role ~= "UNBIND" then
+                                    if devid == my_devid or (devid~=my_devid and is_in_record(my_devid)==true) then
+                                        if is_in_record(devid) == false then
+                                            if devid == my_devid then
+                                                dbg("to_get_info " .. devid .. " first, clean old record data")
+                                                os.execute("rm -rf /var/run/record_* >/dev/null 2>&1")
+                                                os.execute("rm -rf /var/run/lookup* >/dev/null 2>&1")
+                                                os.execute("rm -rf /var/run/max_record >/dev/null 2>&1")
+                                            end
+                                                dbg("to_get_info " .. devid)
+                                                to_get_info[#to_get_info+1] = dev.ip
+                                                to_get_info[#to_get_info+1] = "1"
+                                        else
+                                            if #to_delete_info > 0 then
+                                                for i=#to_delete_info, 1, -1 do
+                                                    if to_delete_info[i] == devid then
+                                                        dbg("discover " .. devid .. " again, remove to to_delete_info list")
+                                                        table.remove(to_delete_info, i)
+                                                        break
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    else
+                                        dbg(my_devid .. " is not in record, " .. devid .. " add to record later")
+                                    end
+                                end
+                            else
+                                dbg(devid .. " is old software version, not to_get_info")
+                            end
+                            -- check and update dev's oui_version in bind_device_list
+                            local update = sync.update_bind_device_oui_version(devid,dev.oui_version)
+
+                            -- if dev's oui_version update , check and update network_oui
+                            if update or sync.get_network_oui_version() == nil then
+                                sync.update_network_oui()
+                            end
+                        end
+                        devlist[devid] = dev
+                    else
+                        dbg("Warning: Peer %s has same IP (%s) as peer %s. Ignored"
+                                % {tostring(devid), tostring(ip), tostring(iplist[ip])})
+                        is_bad_ip = true
+                    end
+                end
+
+                if my_role == "AP" and cfggroup.gid and is_bind and not binding and not is_bad_ip then
+                    local need_to_get = true
+                    for record_devid, info in pairs(record_channel) do
+                        if devid == record_devid and info.status ~= "try_next" then
+                            need_to_get = false
+                        end
+                    end
+                    if need_to_get then
+                        to_get_sup_channel[#to_get_sup_channel + 1] = devid
+                    end
+                end
+
+                if cfggroup.gid and is_bind and not binding and not is_bad_ip and not is_myself then                   
+                    if my_role == "AP" and dev.role == "RE" then
+                        add_dhcp_reservation_maybe(dev)
+                    end
+
+                    local sync_matched = sync.compare_sync_version(dev.sync_version, sync_ver) == 0
+                    if my_role == "RE" and dev.role == "AP" then
+                        if my_state == "inactive" then
+                            activate()
+                        end
+                    end
+
+                    --dbg("dev.config_version: %s my config_version: %s" % {
+                    --            tostring(dev.config_version), tostring(cfg_ver)
+                    --    })
+
+                    if sync_matched then
+                        local res = sync.compare_config_version(dev.config_version, cfg_ver)
+                        if res > 0 then
+                            dbg("peer's config version is newer: %s > %s" % {
+                                    tostring(dev.config_version), tostring(cfg_ver)
+                            })
+                            stop_update = true
+                        elseif res < 0 then
+                            if my_mode == "AP" and is_in_record(devid) == true and dev.need_account_digest then
+                                to_update[#to_update+1] = dev.ip
+                            elseif not dev.need_account_digest then
+                                dbg("old firmware will not do user-config sync " .. devid)
+                            else
+                                dbg("not in record, update later, do nothing " .. devid)
+                            end
+                        end
+                    end
+
+                    if my_role == "RE" and dev.role == "AP" then
+                        local ap_channel = {}
+                        ap_channel._2g = dev.channel_2g
+                        ap_channel._5g = dev.channel_5g
+                        ap_channel._5g2 = dev.channel_5g_2
+                        ap_channel._6g = dev.channel_6g
+                        ap_channel._6g2 = dev.channel_6g_2
+                        --[[
+                        No need to check if channel needs to be modified here because
+                        the function set_channel() will decide whether to set the channel.
+                        --]]
+                        set_channel(ap_channel)
+                    end
+                end
+            end
+        end
+    end
+
+    tdpcli:close() 
+
+    if not sync.get_binding_flag() then
+        for k, v in pairs(devlist) do
+            if v.countdown == INIT_COUNTDOWN - 1 then
+                local _ubus = ubus.connect()
+                local _arg = {}
+                _arg.count = INIT_COUNTDOWN
+                _arg.interval = PROBE_INTERVAL
+                _ubus:call("sync", "boost", _arg)
+                _sync_boost_falsg = true
+            end
+        end
+    end
+    
+    if list_is_empty == false then
+        dbg("online_inform_list"..json.encode(online_inform_list))
+        deco_iface.inform_online_event_to_all(online_inform_list)
+        if my_role == "AP" then
+            os.execute("lua /usr/lib/lua/luci/tools/get_device_info_cache.lua '"..json.encode(online_inform_list).."'  &")
+        end
+
+        local arp_agent_uci = require("luci.model.uci").cursor()
+        local arp_agent_support = arp_agent_uci:get_profile("arp_agent","support") or "no"
+        if arp_agent_support == "yes" and my_role == "AP" then
+            sys.fork_exec("arp_syn_notcmp &")
+        end
+    end
+
+    if #to_get_sup_channel > 0 then
+        local cmd = "lua /usr/lib/lua/luci/tools/get_sup_channel.lua add '"..json.encode(to_get_sup_channel).."'  &"
+        dbg(cmd)
+        os.execute(cmd)
+    end
+
+    if #to_get_sup_channel > 0 then
+        local cmd = "lua /usr/lib/lua/luci/tools/get_sup_channel.lua add '"..json.encode(to_get_sup_channel).."'  &"
+        dbg(cmd)
+        os.execute(cmd)
+    end
+
+    if is_guest_mix == true then
+        --dbg("DECO RE in mix network, guest network mix")
+        set_guest_mix( true )
+    else
+        --dbg("DECO RE in signal network, guest network revert")
+        set_guest_mix( false )
+    end
+
+    if sync.get_binding_flag() then
+        dbg.print("==============binding now, stop update================")
+        stop_update = true
+    end 
+
+    if not stop_update and #to_remove > 0 then
+        sync.remove_local_device_list(to_remove)      
+        sync.update_network_oui()
+    end
+
+    if not stop_update and #to_reset > 0 then
+        for k, v in pairs(to_reset) do
+            if sync.is_bind_device(to_reset[k]) then
+                to_reset[k] = nil
+            end
+        end
+    end         
+
+
+    if #to_get_info > 0 then
+        dbg("to_get_info: " .. json.encode(to_get_info))
+    end
+    if #to_delete_info > 0 then
+        dbg("to_delete_info: " .. json.encode(to_delete_info))
+    end
+    if #to_update > 0 then
+        dbg("to_update: " .. json.encode(to_update))
+    end
+
+    finalize{
+        success = 0,
+        data = devlist,
+        to_get_info = (#to_get_info > 0) and to_get_info or nil,
+        to_delete_info = (#to_delete_info > 0) and to_delete_info or nil,
+        to_update = (not stop_update and #to_update > 0) and to_update or nil,
+        to_reset = (not stop_update and #to_reset > 0) and to_reset or nil,
+        to_bind = (not stop_update and #to_bind > 0) and to_bind or nil               
+    }
+end
+
+script.run(main)

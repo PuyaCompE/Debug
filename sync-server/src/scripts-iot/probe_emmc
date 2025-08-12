@@ -1,0 +1,253 @@
+#!/usr/bin/lua
+
+local tmpv2 = require "tmpv2"
+local json = require "luci.json"
+local util = require "luci.util"
+local dbg = require "luci.tools.debug"
+local nw = require "luci.model.network"
+local sync = require "luci.model.sync"
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local subprocess = require "luci.model.subprocess"
+local script = require "sync-script"
+require "luci.ip"
+
+local die = script.die
+local finalize = script.finalize
+
+local infile = arg[1]
+local outfile = arg[2]
+
+local INIT_COUNTDOWN = 4
+
+script.outfile = outfile
+
+local function devlist_age(devlist)
+    for k, v in pairs(devlist) do
+        v.countdown = v.countdown - 1
+        if v.countdown <= 0 then
+            devlist[k] = nil
+        end
+    end
+
+    return devlist
+end
+
+local function devlist_to_iplist(devlist)
+    local iplist = {}
+    for k, v in pairs(devlist) do
+        local ip = luci.ip.IPv4(v.ip):string()
+        assert(iplist[ip] == nil)
+        iplist[ip] = k
+    end
+    return iplist
+end
+
+local function main()
+    assert(infile and outfile, "invalid arguments")
+
+    local old_devlist = infile == "-" and {} or script.read_infile(infile)
+    old_devlist = devlist_age(old_devlist)
+    local iplist = devlist_to_iplist(old_devlist)
+
+    local group = sync.read_group_info()
+    if not group.gid then
+        die("not in any group")
+    end
+    local emmc_cfg_ver = sync.get_emmc_config_version()
+    local fw_ver = sync.get_firmware_version()
+
+    local my_role = sync.get_role()
+    local my_devid = sync.get_device_id()
+
+    local nw = nw.init()
+    local net = nw:get_network("lan") or die("no network")
+    local my_ip_s = net:ipaddr()
+    my_ip_s = subprocess.call_output({"ifconfig", "br-lan"}):match("inet addr:([%d%.]+)")
+
+    if not my_ip_s then
+        dbg("Warning: I have no IP")
+        finalize{success = 0}
+        return
+    end
+
+    local AP_IP_s = my_ip_s:match("(%d+%.%d+%.%d+)%.%d+")
+    if not AP_IP_s then
+        dbg("Warning: I have bad IP", my_ip_s)
+        finalize{success = 0}
+        return
+    end
+
+    local AP_IP = luci.ip.IPv4(AP_IP_s .. ".1")
+
+    local my_ip = luci.ip.IPv4(my_ip_s)
+
+    local ifc = net:get_interface()
+    local ipaddr = ifc:ipaddrs()
+    ipaddr = #ipaddr > 0 and ipaddr[1] or die("no ip address")
+    ipaddr = ipaddr:broadcast():string()
+
+    local tdpcli = tmpv2.tdp_client(ipaddr)
+    tdpcli:set_timeout(5)
+
+    local data = {
+        device_id = my_devid,
+        group_id = group.gid,
+        emmc_config_version = emmc_cfg_ver,
+        firmware_ver = fw_ver,
+        role = my_role,
+        ip = my_ip_s,
+    }
+
+    local tmp_port_ver = "v2"
+    local fp = io.open("/tmp/ssh_client_port", "r")
+
+    if fp then
+        local ssh_port = fp:read("*n")
+
+        if ssh_port == 22 then
+            tmp_port_ver = "v1"
+        end
+
+        fp:close()
+    end
+       
+    -- 默认v2，表示SSH加密方式去掉了不安全算法，并且group key已经是rsa 2048
+    -- v1, 表示SSH加密方式去掉了不安全算法，但有部分样机group key还没更新到rsa 2048
+    -- v0, 网络中有旧设备，SSH加密方式和ssh pub key都需要兼容旧的
+    -- 不带这个字段的是旧设备
+    local sv = "v2"
+    
+    -- 查看group info是否包含rsa key 2048，对于还未绑定状态则不用看rsa key 2048
+    if cfggroup.gid and cfggroup.key2048 == nil then
+        sv = "v1"
+    else
+        -- 查看当前整个网络协商的版本
+        local fp_1 = io.open("/tmp/ssh_client_sec", "r")
+        if fp_1 then
+            local ssh_sec = fp_1:read("*l")
+
+            if ssh_sec == "v0" then
+                sv = "v0"
+            end
+
+            fp_1:close()
+        end
+    end
+
+    local data, msg = tdpcli:send_request("SYNC_CONFIG_EMMC",
+                                          json.encode{
+                                              params = {
+                                                  group_hid = nixio.bin.crc32(group.gid),
+                                                  secret = sync.encrypt_table(data,
+                                                                              group.key),
+                                                  tmp_port_ver = tmp_port_ver,
+                                                  sv = sv
+                                              }
+                                          }
+    )
+    if not data then
+        die(msg)
+    end
+
+    local devlist = old_devlist
+    local to_update_emmc = {}
+    local stop_update_emmc = false
+    while true do
+        local data, msg = tdpcli:recv_reply(0xc402)
+        if not data then
+            if msg == "timeout" then
+                break
+            end
+            die(msg)
+        end
+
+        data = json.decode(data)
+        if data.error_code ~= 0 then
+            -- Ignore error for group id being mismatched.
+            if data.error_code ~= -3000 then
+                dbg("Warning:", data.msg)
+            end
+        end
+
+        local result = data.result
+        if data.error_code == 0 and result and result.secret then
+            result = sync.decrypt_table(result.secret, group.key)
+        else
+            result = nil
+        end
+        
+        --dbg("[lua]probe_emmc result: ".. json.encode(result))
+        if result
+            and result.group_id == group.gid
+            and result.emmc_config_version
+            and result.ip
+            and result.device_id
+            and result.firmware_ver
+        then
+            if sync.compare_firmware_version(result.firmware_ver, fw_ver) == 0 then
+                local devid = tostring(result.device_id)
+                if not devlist[devid] or devlist[devid].countdown < INIT_COUNTDOWN then
+                    local dev = {
+                        role = result.role,
+                        ip = result.ip,
+                        mac = result.mac,
+                        fw_version = result.firmware_ver,
+                        emmc_config_version = result.emmc_config_version,                 
+                        countdown = INIT_COUNTDOWN,                    
+                    }
+
+                    local peer_ip = luci.ip.IPv4(dev.ip)
+                    local is_myself = my_devid == devid
+                    local is_bad_ip = (not is_myself and my_ip == peer_ip)
+
+                    if is_bad_ip then
+                        dbg("Warning: Peer %s (%s) has bad IP %s. Ignored"
+                                % {tostring(dev_id), tostring(dev.role), tostring(dev.ip)})
+                    end
+
+                    if not is_bad_ip then
+                        local ip = luci.ip.IPv4(dev.ip):string()
+                        if not iplist[ip]
+                            or devlist[iplist[ip]].countdown < dev.countdown
+                        then
+                            if iplist[ip] and iplist[ip] ~= devid then
+                                dbg("Kill aged device %s with same IP %s"
+                                        % {tostring(iplist[ip]), tostring(ip)})
+                                devlist[iplist[ip]] = nil
+                            end
+
+                            iplist[ip] = devid
+                            devlist[devid] = dev
+                        else
+                            dbg("Warning: Peer %s has same IP (%s) as peer %s. Ignored"
+                                    % {tostring(devid), tostring(ip), tostring(iplist[ip])})
+                            is_bad_ip = true
+                        end
+                    end
+
+                    if not is_bad_ip and not is_myself then
+                        res = sync.compare_config_version(dev.emmc_config_version, emmc_cfg_ver)
+                        if res > 0 then
+                            dbg("peer's emmc config version is newer: %s > %s" % {
+                                    tostring(dev.emmc_config_version), tostring(emmc_cfg_ver)})
+                            stop_update_emmc = true
+                        elseif res < 0 then
+                            to_update_emmc[#to_update_emmc+1]=dev.ip
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    tdpcli:close()
+
+    finalize{
+        success = 0,
+        data = devlist,
+        to_update_emmc = (not stop_update_emmc and #to_update_emmc > 0) and to_update_emmc or nil
+    }
+end
+
+script.run(main)

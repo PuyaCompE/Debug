@@ -1,0 +1,92 @@
+#!/bin/sh
+
+local wifi_near_threshold="-60"
+local wifi_is_near="0"
+local wifi_sta_devices=
+local link_sta_cnt='0'
+local signal="0"
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+get_sta_signal() {
+    local iface=$1
+    local wifihal_support=$(uci get profile.wireless.wifihal_support -c /etc/profile.d -q)
+    if [ -n "$iface" ]; then
+        if [ "$wifihal_support" != "yes" ];then
+            local assoc_str=$(iwconfig $iface)
+            if $(echo "$assoc_str" | grep 'Access Point: ' | grep -v 'Not-Associated' > /dev/null); then
+                signal=$(echo "$assoc_str" | sed -n 's/^.*Signal level=\(-\?[0-9]\+\) .*$/\1/p')
+            fi
+        else
+            signal_json=$(wifiapi -i $iface assoc_info)
+            json_load "$signal_json"
+            json_get_var signal rssi
+        fi
+
+    fi
+}
+
+get_sta_ifaces() {
+    local config="$1"
+    local iface network disabled mode is5g
+
+    config_get iface "$config" vapname
+    config_get mode "$config" mode
+    config_get disabled "$config" disabled '0'
+
+    if [ -n "$iface" -a "$mode" = "sta" -a "$disabled" -eq 0 ]; then
+        wifi_sta_devices="${wifi_sta_devices}${wifi_sta_devices:+" "}${iface}"          
+    fi
+}
+    
+
+is_sta_ready() { 
+    wifi_sta_devices=
+    
+    config_load wireless
+    config_foreach get_sta_ifaces wifi-iface 
+
+    if [ -n "$wifi_sta_devices" ]; then
+        for interface in $wifi_sta_devices; do
+            signal="0"
+            get_sta_signal $interface
+            if [ "$signal" -ne 0 ]; then
+                link_sta_cnt=$((link_sta_cnt+1))
+                if [ "$signal" -gt "$wifi_near_threshold" ]; then
+                    wifi_is_near="1"
+                fi
+            fi           
+        done
+    fi
+    
+    if [ "$link_sta_cnt" -lt 2 -a "$wifi_is_near" = "1" ]; then
+        return 1
+    else
+        return 0
+    fi
+       
+}
+
+wake_up_sync() {
+    if [ $1 -ne 0 ]; then
+        ubus call sync boost '{"begin":10}' >/dev/null
+    else
+        ubus call sync boost >/dev/null
+        ubus call sync probe >/dev/null
+    fi
+}
+
+if [ "$TYPE" = "lan" -a "$EVENT" = "UPDATE" ]; then
+    if [ -f /tmp/group-info ] && [ ! -s /tmp/group-info ]; then
+        wake_up_sync "0" &
+        return
+    fi
+
+    if is_sta_ready ; then
+        wake_up_sync "0" &
+    else
+        wake_up_sync "1" & 
+    fi
+
+fi
