@@ -1,0 +1,20 @@
+#!/bin/sh
+
+#input what you want to do here. For example: ubus call awn xxxxxx
+handle_onboarding() {
+    # call awn by ubus, maybe need to sleep for a few seconds?
+    # alg_strategy = 3 means GET_BEST
+    ubus call awn ai_start '{"policy":3}'
+}
+
+handle_re_connect() {
+    # call awn by ubus, maybe need to sleep for a few seconds?
+    # alg_strategy = 3 means GET_BEST
+    ubus call awn ai_start '{"policy":3}'
+}
+
+case "$1" in
+re_conn) handle_re_connect ;;
+onboarding) handle_onboarding ;;
+*) echo "Nothing to be done." >/dev/console ;;
+esac

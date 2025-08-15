@@ -1,0 +1,3 @@
+# let awn write ip limitation to kmod tp_preconfig_hook
+# set limit for ISP DCMP PRECONFIG vap athx8
+ubus call awn preconfig '{"operation":13}'

@@ -1,0 +1,20 @@
+#!/usr/bin/env lua
+
+local uci = require "luci.model.uci"
+local uci_r = uci.cursor()
+
+local mode = arg[1]
+
+if not mode then
+	return false
+end
+
+if mode == "FAP" then
+    uci_r:set("auto_wifi_net", "auto_wifi_net", "awn_weight", 1)
+elseif mode == "RE" then
+    uci_r:set("auto_wifi_net", "auto_wifi_net", "awn_weight", 0)
+end
+    
+uci_r:commit("auto_wifi_net")
+
+

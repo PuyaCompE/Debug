@@ -1,0 +1,33 @@
+#!/usr/bin/lua
+
+local sys    = require "luci.sys"
+local dbg    = require "luci.tools.debug"
+local sync   = require "luci.model.sync"
+
+dbg.print("check process")
+local cur_time
+local begin_time
+local end_time
+local pack = sync.get_preconf_pack()
+local preconf_id = sync.get_pregroup_crc32_hex()
+
+
+cur_time = sys.uptime()
+begin_time = tonumber(cur_time)
+
+
+while (true) do
+    sys.call("sleep 10")
+    cur_time = sys.uptime()
+    end_time = tonumber(cur_time)
+    --dbg.print("endtime " .. tostring(end_time) .. "begintime " .. tostring(begin_time))
+    if end_time > begin_time + 1800 then
+        local msgcenter = require("luci.model.message_center").Msgcenter()
+        local bind_num = (require "luci.model.sync").get_bind_num_by_preconf_id(preconf_id)
+        dbg.print("timeout, bind_num " .. tostring(bind_num) .. "pack " .. tostring(pack))
+        if tonumber(bind_num) < tonumber(pack) then
+            msgcenter:add_auto_pair(true, nil)
+        end
+        os.exit(1)
+    end
+end

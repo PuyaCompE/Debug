@@ -1,0 +1,661 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2016 Tp-link.com
+# Author: Weng Kaiping <wengkaiping@tp-link.net>
+# Date: 25Apr16
+
+START=42
+
+USE_PROCD=1
+RESPAWN_THRESHOLD=120
+RESPAWN_TIMEOUT=5
+RESPAWN_RETRIES=10
+SERVICE_PATH="/usr/sbin/awnd"
+
+. /lib/functions.sh
+
+STDERR=/dev/console
+STDNULL=/dev/null 2>&1
+
+REPEATER_MODE=0
+AP_MODE=1
+
+DFT_LAN_MAC="00:0A:EB:93:AB:00"
+CONFIGFILE="/tmp/auto-wifi-network.conf"
+SCANFILE="/tmp/wifi_scan_running"
+GROUP_INFO_FILE="/tmp/group-info"
+GROUP_ROLE_BAK="/tmp/bak_group_role"
+PIDFILE="/var/run/awnd.pid"
+
+hw_ver=$(getfirm HW_VER)
+if [ "$hw_ver" -ge "100" ]; then
+	let "hw_ver=hw_ver%100"
+fi
+
+limit_scan_band1=1
+
+local sgmac_support=$(uci -c /etc/profile.d get profile.switch.sgmac)
+if [ -n "$sgmac_support" ] && [ "yes" == "$sgmac_support" ]; then
+	PLC_DEFAULT_INTERFACE="eth0-p2"
+else
+	PLC_DEFAULT_INTERFACE="eth2"
+fi
+
+xappend() {
+	local value="$1"
+
+	echo "${value}" >> $CONFIGFILE
+}
+
+append_param() {
+	local section="$1"
+	local option="$2"
+	local key="$3"
+	local _tmp
+	config_get _tmp "$section" "$option"
+	[ -z "$_tmp" ] && return 0
+	xappend "$key=$_tmp"
+}
+
+generate_config() {
+	local cfg="$1"
+
+	append_param "$cfg" awn_enable            "enable"
+	append_param "$cfg" tm_scan_start         "tm_scan_start"
+	append_param "$cfg" tm_scan_interval      "tm_scan_interval"
+	append_param "$cfg" tm_scan_sched         "tm_scan_sched"
+	append_param "$cfg" tm_status_start       "tm_status_start"
+	append_param "$cfg" tm_status_interval    "tm_status_interval"
+	append_param "$cfg" tm_online_start       "tm_online_start"
+	append_param "$cfg" tm_online_interval    "tm_online_interval"
+	append_param "$cfg" tm_connect_duration   "tm_connect_duration"
+	
+    append_param "$cfg" tm_plc_inspect_start       "tm_plc_inspect_start"
+    append_param "$cfg" tm_plc_inspect_interval    "tm_plc_inspect_interval"
+    append_param "$cfg" tm_eth_inspect_start       "tm_eth_inspect_start"
+    append_param "$cfg" tm_eth_inspect_interval    "tm_eth_inspect_interval"
+    append_param "$cfg" plc_report_interval        "plc_report_interval"
+    append_param "$cfg" eth_report_interval        "eth_report_interval" 
+    append_param "$cfg" plc_entry_aging_time       "plc_entry_aging_time" 
+    append_param "$cfg" eth_entry_aging_time       "eth_entry_aging_time"  
+    
+	append_param "$cfg" scaling_factor        "scaling_factor"
+    append_param "$cfg" high_rssi_threshold   "high_rssi_threshold"
+    append_param "$cfg" low_rssi_threshold    "low_rssi_threshold"
+    append_param "$cfg" best_effort_rssi_threshold  "best_effort_rssi_threshold"     
+    append_param "$cfg" best_effort_rssi_inc  "best_effort_rssi_inc"  
+    append_param "$cfg" best_effort_uplink_rate  "best_effort_uplink_rate"      
+    append_param "$cfg" plc_rate_good         "plc_rate_good"
+    append_param "$cfg" wifi_lost_rate_to_plc "wifi_lost_rate_to_plc"     
+    
+	append_param "$cfg" debug_level           "debug_level"
+
+    if [ -n "$hw_ver" -a "$hw_ver" -ge 94 -a "$hw_ver" -le 96 ]; then
+        xappend "meshmode=wireless_link_up"
+        local modifymode=$(uci get backhaul_optimization.backhaul_optimization.modifymode)
+        if [ ! -f "/tmp/group-info" ]; then
+            nvrammanager -p group-info -r /tmp/group-info
+        fi
+        local role=$(grep -o '"role":"[^"]*"' /tmp/group-info | sed 's/.*"role":"\([^"]*\)".*/\1/')
+        if [ ! "$role" == "RE" ] && [ -z "$modifymode" ]; then
+            uci set backhaul_optimization.backhaul_optimization.mode='wireless_link_up'
+            uci set backhaul_optimization.backhaul_optimization.modifymode='1'
+            uci commit backhaul_optimization
+            if [ "$role" == "AP" ]; then
+                lua -e 'require("luci.sys.config").save_config_version(0)'
+                saveconfig
+            fi
+        fi
+    fi
+
+	config_get limit_scan_band1 "$cfg" limit_scan_band1 "1"
+
+	echo >> $CONFIGFILE
+}
+
+check_backhaul()
+{
+    local dftgroupinfo=""
+    local groupinfo=""
+    local pregroupinfo=""
+    local ssid=""
+    local pass=""
+    
+    # uci_set_state wifi config enable '0'
+    # uci_set_state wifi sta_2g enable '0'
+    # uci_set_state wifi sta_5g enable '0'
+    # uci_set_state wifi sta_5g_2 enable '0'
+    # uci_set_state wifi sta_6g enable '0'
+    # uci_set_state ext_wifi sta_6g_2 enable '0'
+
+    if test -f "/tmp/dft-group-info"
+    then
+        dftgroupinfo=$(cat /tmp/dft-group-info)
+    fi
+    
+    if test -f "/tmp/group-info"
+    then
+        groupinfo=$(cat /tmp/group-info)
+    fi
+
+    if test -f "/tmp/preconf-group-info"
+    then
+        pregroupinfo=$(cat /tmp/preconf-group-info)
+    fi
+
+        if test -f "/tmp/preconfig-group-info"
+    then
+        preconfiggroupinfo=$(cat /tmp/preconfig-group-info)
+    fi
+
+    if [ "$dftgroupinfo" != "" ]; then
+         key=${dftgroupinfo#*key\":\"} && key=${key%%\"*}
+         len=${#key}
+         len=$((len/2))
+         for i in $(seq 1 1 16); do
+             pos=$((i*7))
+             if [ $len -ge $pos ];then
+                 ssid=${ssid}${key:$pos:1}
+             fi     
+         done
+         for i in $(seq 1 1 8); do
+             pos=$((i*11))
+             if [ $len -ge $pos ];then
+                 pass=${pass}${key:$((pos+len)):1}
+             else
+                 pass=${pass}${i}
+             fi        
+         done 
+         
+         uci_toggle_state wifi config ssid "$ssid"
+         uci_toggle_state wifi config password "$pass"         
+
+        if [ "$groupinfo" == "" ]; then
+            uci_toggle_state wifi sta ssid "$ssid"
+            uci_toggle_state wifi sta password "$pass"
+        fi
+    fi
+
+    ssid=""
+    pass=""
+
+	if [ "$pregroupinfo" != "" ]; then
+         key=${pregroupinfo#*key\":\"} && key=${key%%\"*}
+         len=${#key}
+         len=$((len/2))
+         for i in $(seq 1 1 16); do
+             pos=$((i*7))
+             if [ $len -ge $pos ];then
+                 ssid=${ssid}${key:$pos:1}
+             fi     
+         done
+         for i in $(seq 1 1 8); do
+             pos=$((i*11))
+             if [ $len -ge $pos ];then
+                 pass=${pass}${key:$((pos+len)):1}
+             else
+                 pass=${pass}${i}
+             fi        
+         done 
+         
+         uci_toggle_state wifi config pre_ssid "$ssid"
+         uci_toggle_state wifi config pre_password "$pass"         
+
+    fi
+
+    ssid=""
+    pass=""
+    if [ "$preconfiggroupinfo" != "" ]; then
+         key=${preconfiggroupinfo#*key\":\"} && key=${key%%\"*}
+         len=${#key}
+         len=$((len/2))
+         for i in $(seq 1 1 16); do
+             pos=$((i*7))
+             if [ $len -ge $pos ];then
+                 ssid=${ssid}${key:$pos:1}
+             fi     
+         done
+         for i in $(seq 1 1 8); do
+             pos=$((i*11))
+             if [ $len -ge $pos ];then
+                 pass=${pass}${key:$((pos+len)):1}
+             else
+                 pass=${pass}${i}
+             fi        
+         done 
+         
+         uci_toggle_state wifi preconfig ssid "$ssid"
+         uci_toggle_state wifi preconfig password "$pass"               
+
+    fi
+
+    ssid=""
+    pass=""
+
+    if [ "$groupinfo" != "" ]; then
+         key=${groupinfo#*key\":\"} && key=${key%%\"*}
+         len=${#key}
+         len=$((len/2))
+         for i in $(seq 1 1 16); do
+             pos=$((i*7))
+             if [ $len -ge $pos ];then
+                 ssid=${ssid}${key:$pos:1}
+             fi     
+         done
+         for i in $(seq 1 1 8); do
+             pos=$((i*11))
+             if [ $len -ge $pos ];then
+                 pass=${pass}${key:$((pos+len)):1}
+             else
+                 pass=${pass}${i}
+             fi        
+         done 
+         
+         uci_toggle_state wifi backhaul ssid "$ssid"
+         uci_toggle_state wifi backhaul password "$pass"         
+
+         uci_toggle_state wifi sta ssid "$ssid"
+         uci_toggle_state wifi sta password "$pass"
+
+         uci_toggle_state plc config NetworkPassWd "$ssid"
+		#add by wanghao
+		#uci set plc.config.NetworkPassWd="$ssid"
+		#uci commit plc
+		#saveconfig
+		#add end
+    fi
+
+}
+
+generate_wifi_config(){
+	local lan_mac country sid support_ht240
+
+	lan_mac=$(network_get_firm lan)
+	lan_mac=${lan_mac//-/:}
+
+	xappend "net_mac=${lan_mac:-$DFT_LAN_MAC}"
+	
+	support_ht240=$(uci get profile.wireless.ht240_support -c /etc/profile.d/ 2>/dev/null)
+
+    country=`uci get wifi.radio_5g.country`
+    if [ "$country" = "ID" -o "$support_ht240" = "yes" ]; then
+	xappend "limit_scan_band1=0"
+    else
+	xappend "limit_scan_band1=$limit_scan_band1"
+        if [ "$country" = "CA" ]; then
+            xappend "limit_scan_band4=1"
+        fi
+    fi
+
+    # SID B4 work on band4
+    # SID CA work on band1 and band4, band1 support 160M
+    sid=$(getfirm SPECIAL_ID)
+    [ "$sid" = "43410000" ] && xappend "limit_scan_band1=0"
+    [ "$sid" = "43410000" ] && xappend "only_scan_band4=0"
+    [ "$sid" = "42340000" ] && xappend "limit_scan_band1=0"
+    [ "$sid" = "42340000" ] && xappend "limit_scan_band4=1"
+    # SID NZ work on band1 and band4, band1 support 160M
+    [ "$sid" = "4E5A0000" ] && xappend "limit_scan_band1=0"
+    [ "$sid" = "4E5A0000" ] && xappend "only_scan_band4=0"
+
+    local support_6g=$(uci get profile.band_6g.support -c /etc/profile.d/ -q)
+    if [ -n "$support_6g" ] && [ "$support_6g" = "yes" ]; then
+        local ssid=`uci get wifi.ap.ssid -q`
+        local ssid_6g=`uci get wifi.ap.ssid_6g -q`
+        if [ -z $ssid_6g ] && [ -n "$ssid" ]; then
+            local union="_6GHz"
+            echo "!!!!! $ssid" > /dev/console
+            ssid_6g=$ssid$union
+            echo "!!!!! set 6g ssid :$ssid_6g" > /dev/console
+            uci set wifi.ap.ssid_6g="$ssid_6g"
+            uci commit wifi
+            saveconfig
+        fi
+    fi
+
+	echo >> $CONFIGFILE
+}
+
+generate_plc_config(){
+    local plc_attached='0'
+
+    config_load 'plc'
+    config_get_bool plc_enabled config 'Enabled' '0'
+    config_get plc_ifname config PlcIfname PLC_DEFAULT_INTERFACE
+    
+    [ "$plc_enabled" -gt 0 ] && [ -d /sys/class/net/$plc_ifname ] && { 
+        plc_attached='1'
+        xappend "plc_ifname=${plc_ifname:-$PLC_DEFAULT_INTERFACE}" 
+        
+    }
+    
+    xappend "plc_attached=$plc_attached" 
+
+    echo >> $CONFIGFILE
+}
+
+generate_eth_config(){
+    local lan_ifname wan_ifname ifnames iface
+    local eth_ifnames=
+
+    ifnames=`uci get "network.lan.ifname"`
+    for iface in $ifnames; do
+        eth_ifnames="${eth_ifnames}${eth_ifnames:+","}${iface}"
+    done     
+ 
+    config_load 'network'
+    #config_get lan_ifname lan ifname "br-lan"
+    config_get wan_ifname wan device "br-wan" 
+    
+    xappend "lan_ifname=${lan_ifname:-br-lan}"
+    xappend "wan_ifname=${wan_ifname:-br-wan}"
+    
+    #[ -n "$eth_ifnames" ] && xappend "eth_ifnames=$eth_ifnames" 
+    
+    echo >> $CONFIGFILE
+}
+
+reset_device_type(){
+	config_load repacd
+        config_get  old_type repacd DeviceType
+
+        uci_revert_state repacd
+	uci_set_state repacd repacd DeviceType 'AP'
+	uci_set_state repacd repacd GatewayConnectedMode 'CAP'
+
+	uci_revert_state wifi
+	uci_set_state wifi radio_2g channel '0'
+	uci_set_state wifi radio_5g channel '0'
+
+	if [ -f /tmp/wifi_set_done ] && [ ! "$old_type" = "AP" ]; then
+	    /etc/init.d/repacd restart
+	fi
+}
+
+generate_backhaul_config(){
+    backhaul_option=$1
+    echo "backhaul_option is $backhaul_option"
+    # 0:wifi and plc backhaul disable;1:wifi backhaul only;
+    # 2; plc backhaul only;3:wifi and plc backhaul(default);
+
+    xappend "backhaul_option=$backhaul_option"
+}
+
+generate_profile_config(){
+    local tri_band=$(uci get profile.tri_band.support -c /etc/profile.d)
+    local tri_band_comp=$(uci get profile.tri_band.band_compose -c /etc/profile.d)
+    local four_band=$(uci get profile.four_band.support -c /etc/profile.d)
+    local four_band_comp=$(uci get profile.four_band.band_compose -c /etc/profile.d)
+    local five_band=$(uci get profile.five_band.support -c /etc/profile.d)
+    local band_5g_2=$(uci get profile.band_5g_2.support -c /etc/profile.d)
+    local band_6g=$(uci get profile.band_6g.support -c /etc/profile.d)
+    local band_6g_2=$(uci get profile.band_6g_2.support -c /etc/profile.d)
+
+    if [ "$tri_band" == "yes" ]; then
+        xappend "band_num=3"
+        [ "$tri_band_comp" == "5g 6g" ]&& {
+            xappend "tri_band_6g=1"
+        }
+        [ "$tri_band_comp" == "5g 5g2" ]&& { 
+            xappend "tri_band_6g=0"
+        }
+
+    else 
+        if [ "$four_band" == "yes" ]; then
+            xappend "band_num=4"        
+            [ "$four_band_comp" == "6g 6g2" ]&& {
+                xappend "four_band_6g2=1"
+            }
+            [ "$four_band_comp" == "5g2 6g" ]&& { 
+                xappend "tri_band_6g2=0"
+            }
+        else 
+            if [ "$five_band" == "yes" ]; then
+                xappend "band_num=5"
+            else
+                xappend "band_num=2"
+            fi
+        fi
+    fi
+    
+    if [ "$band_5g_2" == "yes" ]; then
+        xappend "sp_5g2=1"
+    fi
+    if [ "$band_6g" == "yes" ]; then
+        xappend "sp_6g=1"
+    fi
+    if [ "$band_6g_2" == "yes" ]; then
+        xappend "sp_6g2=1"
+    fi
+
+    echo >> $CONFIGFILE
+}
+
+device_role_check(){
+    local wifi_type gateway_reload
+    local role_old groupinfo role_new role_valid
+    config_load repacd
+    config_get wifi_type repacd WifiType 'none'
+    config_clear
+    if [ "$wifi_type" != 'BCM' ]; then
+        if [ -s $GROUP_INFO_FILE ]; then
+            if [ -s $GROUP_ROLE_BAK ]; then
+                role_old="$(cat $GROUP_ROLE_BAK)"
+            fi
+            groupinfo="$(cat $GROUP_INFO_FILE)"
+            role_new=${groupinfo#*role\":\"} && role_new=${role_new%%\"*}
+            if [ "$role_new" = "AP" ] || [ "$role_new" = "RE" ]; then
+                role_valid="1"
+            fi
+            echo "role_old:($role_old) role_new:($role_new)" > /dev/console
+
+            if [ -n "$role_new" ] && [ "$role_valid" = "1" ]; then
+                echo "$role_new" > $GROUP_ROLE_BAK
+                if [ -n "$role_old" ] && [ "$role_new" != "$role_old" ]; then
+                    if [ "$role_new" = "AP" ] && [ -f /etc/init.d/bandwidth_mix_network ]; then
+                        /etc/init.d/bandwidth_mix_network reload
+                    fi
+                fi
+            fi
+        fi
+        return
+    fi
+
+    # gateway_reload DUT: to wifi reload when set gateway(change FAP)
+    # FAP: wlx_mode=ap ==> AP has no wpa_supplicant;               hostapd control: wlx wlx1 ...wlx5
+    # AP --> RE,to wifi reload: wlx_mode=sta, open wpa_supplicant; hostapd control:     wlx1 ...wlx5
+    gateway_reload=$(uci get profile.gateway_reload.support -c /etc/profile.d)
+    if [ -n "$gateway_reload" ] && [ "$gateway_reload" = "yes" ]; then
+
+        if [ -s $GROUP_INFO_FILE ]; then
+
+            if [ -s $GROUP_ROLE_BAK ]; then
+                role_old="$(cat $GROUP_ROLE_BAK)"
+            fi
+            groupinfo="$(cat $GROUP_INFO_FILE)"
+            role_new=${groupinfo#*role\":\"} && role_new=${role_new%%\"*}
+            if [ "$role_new" = "AP" ] || [ "$role_new" = "RE" ]; then
+                role_valid="1"
+            fi
+
+            echo "role_old:($role_old) role_new:($role_new)" > /dev/console
+            if [ -n "$role_old" ] && [ "$role_valid" = "1" ] && [ "$role_new" != "$role_old" ]; then
+                echo "role $role_old changed to $role_new:rm /tmp/etc/config/wifi to wifi reload" > /dev/console
+                sleep 10
+                hostapd_cli -i wl0 disable
+                hostapd_cli -i wl1 disable
+                hostapd_cli -i wl2 disable
+                hostapd_cli -i wl01 disable
+                hostapd_cli -i wl11 disable
+                hostapd_cli -i wl21 disable
+                sleep 1
+
+                killall hostapd
+                sleep 10
+                local hostapd_status=$(pgrep hostapd)
+                if [ -n "$hostapd_status" ]; then
+                killall hostapd
+                    sleep 3
+                    killall -9 hostapd
+                fi
+
+                local wpasupp_status=$(pgrep wpa_supplicant)
+                if [ -n "$wpasupp_status" ]; then
+                    killall wpa_supplicant
+                    usleep 500000
+                    killall -9 wpa_supplicant
+                fi
+                echo "====== rmmod wl =====================" > /dev/console
+                rmmod wl
+                #wlconf wl0 down
+                #wlconf wl1 down
+                #wlconf wl2 down
+                rm -f /tmp/wl*_hapd.pid
+                rm -f /tmp/etc/config/wifi
+            fi
+
+            if [ -n "$role_new" ] && [ "$role_valid" = "1" ]; then
+                echo "$role_new" > $GROUP_ROLE_BAK
+                if [ "$role_new" = "AP" ] && [ -f /etc/init.d/bandwidth_mix_network ]; then
+                    /etc/init.d/bandwidth_mix_network reload
+                fi
+            fi
+        fi
+
+    fi
+}
+
+
+get_prefer_config(){
+    local dev_id prefer_devid prefer_mac
+    dev_id=$(getfirm DEV_ID)
+
+    config_load device_prefer
+    config_get prefer_devid $dev_id prefer_connect_device '0'
+    
+    if [ "$prefer_devid" = "0" ]; then
+        return 0
+    else
+        config_load bind_device_list
+        config_get prefer_mac $prefer_devid mac '0'
+    fi
+    
+    if [ "$prefer_mac" = "0" ]; then
+        return 0
+    else
+        xappend "prefer_mac=$prefer_mac"
+        echo >> $CONFIGFILE
+    fi
+}
+
+load()
+{
+	echo "# auto-generated config file from /etc/config/auto_wifi_net" > $CONFIGFILE
+
+	# Load auto wifi network config
+	config_load auto_wifi_net
+	config_get_bool enabled auto_wifi_net 'awn_enable' '0'
+	config_get backhaul_option auto_wifi_net 'backhaul_option' '3'
+
+	[ "$enabled" -gt 0 ] || {
+	    return 1
+	}
+	
+
+	config_foreach generate_config auto_wifi_net
+	config_clear
+
+    # config backhual SSID/pwd according to group-info
+    check_backhaul
+
+	# Load wireless common config
+	generate_wifi_config	
+	generate_eth_config
+	generate_plc_config
+	generate_backhaul_config $backhaul_option
+    generate_profile_config
+	get_prefer_config
+
+	echo >> $CONFIGFILE
+	config_clear
+
+    # check group-info role for BCM DUT AND QCA 5G2 DUT
+    device_role_check
+
+    procd_open_instance
+    procd_set_param command ${SERVICE_PATH} -C "$CONFIGFILE"
+    procd_set_param respawn ${RESPAWN_THRESHOLD} ${RESPAWN_TIMEOUT} ${RESPAWN_RETRIES}
+    procd_close_instance	
+
+	return 0
+}
+
+start_service() {
+        
+    #reset_device_type        
+    mkdir -p /tmp/dynamicNetworking
+
+	load
+
+	return 0
+}
+
+stop_service() {
+	[ -f $CONFIGFILE ] && rm -f $CONFIGFILE	
+    [ -f $SCANFILE ] && rm -f $SCANFILE 
+    [ -f $PIDFILE ] && rm -f $PIDFILE
+    rm -rf /tmp/dynamicNetworking/*
+	killall -9 awnd
+}
+
+stop() {
+   	[ -f $CONFIGFILE ] && rm -f $CONFIGFILE	
+    [ -f $SCANFILE ] && rm -f $SCANFILE 
+    [ -f $PIDFILE ] && rm -f $PIDFILE 
+}
+
+reload_service()
+{
+    #优先节点配置文件改变，获取当前优先节点信息
+    if [ "$1" = "check" ]; then
+        local dev_id prefer_devid prefer_mac
+        dev_id=$(getfirm DEV_ID)
+
+        config_load device_prefer
+        config_get prefer_devid $dev_id prefer_connect_device '0'
+
+        if [ "$prefer_devid" = "0" ]; then
+            #找不到优先节点
+            ubus call awn check_prefer_device "{\"new_prefer_mac\":\"\"}"
+            return 0
+        else
+            config_load bind_device_list
+            config_get prefer_mac $prefer_devid mac '0'
+        fi
+
+        if [ "$prefer_mac" = "0" ]; then
+            #找不到优先节点的mac
+            ubus call awn check_prefer_device "{\"new_prefer_mac\":\"\"}"
+            return 0
+        else
+            # 获取最新的优先节点mac
+            ubus call awn check_prefer_device "{\"new_prefer_mac\":\"$prefer_mac\"}"
+        fi
+    else
+        stop
+        load
+    fi
+}
+
+
+boot()
+{
+    check_backhaul
+    start
+}
+
+
+service_triggers() {
+    procd_open_trigger
+    procd_add_config_trigger "config.change" "device_prefer" /etc/init.d/awn reload "check"
+    procd_close_trigger
+}

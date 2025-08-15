@@ -1,0 +1,279 @@
+#!/bin/sh
+
+. /usr/lib/eth-encap/eth_encap.sh
+. /lib/functions/whc-debug.sh
+. /lib/functions.sh
+
+dev_2g=$(uci -c /etc/profile.d/ get interfaces.radio_2g.name 2>/dev/null)
+dev_5g=$(uci -c /etc/profile.d/ get interfaces.radio_5g.name 2>/dev/null)
+dev_5g2=$(uci -c /etc/profile.d/ get interfaces.radio_5g2.name 2>/dev/null)
+dev_6g=$(uci -c /etc/profile.d/ get interfaces.radio_6g.name 2>/dev/null)
+dev_6g2=$(uci -c /etc/profile.d/ get interfaces.radio_6g_2.name 2>/dev/null)
+
+# BCM MODEL
+if [ -f /sbin/ethctl ]; then
+    [ -n "$dev_2g" ] || dev_2g="wifi0"
+    [ -n "$dev_5g" ] || dev_5g="wifi1"
+    [ -n "$dev_5g2" ] || dev_5g2="wifi2"
+    [ -n "$dev_6g" ] || dev_6g="wifi3"
+    [ -n "$dev_6g2" ] || dev_6g2="wifi4"
+fi
+
+cfg_if_2g=
+cfg_if_5g=
+cfg_if_5g2=
+cfg_if_6g=
+cfg_if_6g2=
+cfg_if_all=
+cfg_vaps=
+
+__get_ifaces() {
+    local config="$1"
+    local vapname vapmode nettype device
+    config_get vapname "$config" vapname
+    config_get vapmode "$config" mode
+    config_get nettype "$config" type
+    config_get device "$config" device
+    #echo "vapname:${vapname} vapmode:${vapmode} nettype:${nettype} device:${device}" > /dev/console
+    #2.4G
+    if [ -n "$vapname" ] && [ "$device" = "$dev_2g" ]; then
+        if [ "$vapmode" = "ap" ] && [ "$nettype" = "config" ]; then
+            cfg_if_2g="$vapname"
+        fi
+    fi
+    #5G
+    if [ -n "$vapname" ] && [ "$device" = "$dev_5g" ]; then
+        if [ "$vapmode" = "ap" ] && [ "$nettype" = "config" ]; then
+            cfg_if_5g="$vapname"
+        fi
+    fi
+    #5G2
+    if [ -n "$vapname" ] && [ "$device" = "$dev_5g2" ]; then
+        if [ "$vapmode" = "ap" ] && [ "$nettype" = "config" ]; then
+            cfg_if_5g2="$vapname"
+        fi
+    fi
+    #6G
+    if [ -n "$vapname" ] && [ "$device" = "$dev_6g" ]; then
+        if [ "$vapmode" = "ap" ] && [ "$nettype" = "config" ]; then
+            cfg_if_6g="$vapname"
+        fi
+    fi
+    #6G2
+    if [ -n "$vapname" ] && [ "$device" = "$dev_6g2" ]; then
+        if [ "$vapmode" = "ap" ] && [ "$nettype" = "config" ]; then
+            cfg_if_6g2="$vapname"
+        fi
+    fi
+}
+
+__get_all_interfaces() {
+    config_load wireless
+    config_foreach __get_ifaces wifi-iface
+    config_clear
+}
+
+get_config_vaps() {
+    __get_all_interfaces
+    cfg_vaps="$cfg_if_2g $cfg_if_5g"
+    cfg_if_all="$cfg_if_2g,$cfg_if_5g"
+    if [ -n "$cfg_if_5g2" ]; then
+        cfg_vaps="$cfg_vaps $cfg_if_5g2"
+        cfg_if_all="$cfg_if_all,$cfg_if_5g2"
+    fi
+    if [ -n "$cfg_if_6g" ]; then
+        cfg_vaps="$cfg_vaps $cfg_if_6g"
+        cfg_if_all="$cfg_if_all,$cfg_if_6g"
+    fi
+    if [ -n "$cfg_if_6g2" ]; then
+        cfg_vaps="$cfg_vaps $cfg_if_6g2"
+        cfg_if_all="$cfg_if_all,$cfg_if_6g2"
+    fi
+}
+
+__network_add_vlan_interface() {
+    local new_if="$1"
+    local if_name
+
+    config_load network
+    if [ -n "$new_if" ]; then
+        config_get if_name lan vlanifs
+        if [ -n "$if_name" ]; then
+            [ "$if_name" = "${if_name/$new_if}" ] && if_name="$if_name $new_if"
+        else
+            if_name="$new_if"
+        fi
+        if_name="$(echo $if_name | tr -s ' ')"
+        uci_toggle_state network lan vlanifs "$if_name"
+    fi
+    uci_commit network
+}
+
+__network_del_vlan_interface() {
+    del_if="$1"
+    local if_name
+
+    config_load network
+    if [ -n "$del_if" ]; then
+        config_get if_name lan vlanifs
+        if [ -n "$if_name" ]; then
+            if_name="${if_name/$del_if}"
+            if_name="$(echo $if_name | tr -s ' ')"
+            uci_toggle_state network lan vlanifs "$if_name"
+        fi
+    fi
+    uci_commit network
+
+}
+
+enable_config_network() {
+	local ifname
+	local interface=$(echo "$1" | cut -d ":" -f 1)
+	local id=$2
+
+	ifconfig $interface up
+	ifname=$(brctl show br-lan | grep "$interface.$id")
+	if [ -z "$ifname" ]; then
+		vlan_add $interface $id
+		brctl addif "br-lan" "$interface.$id"
+		ifconfig $interface.$id up
+		__network_add_vlan_interface "$interface.$id"
+	else
+		echo "$ifname already existed, do nothing." > /dev/console
+	fi
+}
+
+disable_config_network() {
+	local ifname
+	local interface=$(echo "$1" | cut -d ":" -f 1)
+	local id=$2
+
+	ifconfig $interface down
+	ifname=$(brctl show br-lan | grep "$interface.$id")
+	if [ -n "$ifname" ]; then
+		ifconfig $interface.$id down
+		brctl delif "br-lan" "$interface.$id"
+		vlan_del "$interface" "$id"
+		__network_del_vlan_interface "$interface.$id"
+	else
+		echo "$interface.$id does not exist, do nothing." > /dev/console
+	fi
+}
+
+check_config_network() {
+	local onboarding
+	local if_name
+
+	whc_wifi_config_lock
+	echo "get whc_wifi_config_lock" > /dev/console
+
+	get_config_vaps
+	if [ -z "$cfg_vaps" ] || [ -z "$cfg_if_all" ]; then
+		echo "no config network vaps" > /dev/console
+		whc_wifi_config_unlock
+		echo "unlock whc_wifi_config_lock" > /dev/console
+		return
+	fi
+
+	onboarding=$(cat /tmp/onboarding)
+	if [ "$onboarding" = "1" ]; then
+
+		for vapname in $cfg_vaps; do
+			if_name=$(uci show | grep vapname | grep "$vapname" | cut -d "=" -f 1 | cut -d "." -f 2)
+			uci_set wireless $if_name disabled 0
+		done
+
+		echo "/sbin/wifi update vap $cfg_if_all" > /dev/console
+		/sbin/wifi update vap "$cfg_if_all"
+
+		for vapname in $cfg_vaps; do
+			enable_config_network $vapname 1
+#			enable_config_network $vapname 2
+		done
+
+	else
+		for vapname in $cfg_vaps; do
+			if_name=$(uci show | grep vapname | grep "$vapname" | cut -d "=" -f 1 | cut -d "." -f 2)
+			uci_set wireless $if_name disabled 1
+		done
+
+		/sbin/wifi update vap "$cfg_if_all"
+
+		for vapname in $cfg_vaps; do
+			disable_config_network $vapname 1
+			disable_config_network $vapname 2
+		done
+	fi
+
+    whc_wifi_config_unlock
+    echo "unlock whc_wifi_config_lock" > /dev/console
+}
+
+open_config_network() {
+    local if_name
+
+    whc_wifi_config_lock
+    echo "get whc_wifi_config_lock" > /dev/console
+
+	get_config_vaps
+	if [ -z "$cfg_vaps" ] || [ -z "$cfg_if_all" ]; then
+		echo "no config network vaps" > /dev/console
+		whc_wifi_config_unlock
+		echo "unlock whc_wifi_config_lock" > /dev/console
+		return
+	fi
+
+	for vapname in $cfg_vaps; do
+		if_name=$(uci show | grep vapname | grep "$vapname" | cut -d "=" -f 1 | cut -d "." -f 2)
+		uci_set wireless $if_name disabled 0
+	done
+
+	echo "/sbin/wifi update vap $cfg_if_all" > /dev/console
+	/sbin/wifi update vap "$cfg_if_all"
+
+	for vapname in $cfg_vaps; do
+		enable_config_network $vapname 1
+#		enable_config_network $vapname 2
+	done
+
+    whc_wifi_config_unlock
+    echo "unlock whc_wifi_config_lock" > /dev/console
+}
+
+close_config_network() {
+    local if_name
+
+    whc_wifi_config_lock
+    echo "get whc_wifi_config_lock" > /dev/console
+
+	get_config_vaps
+
+	if [ -z "$cfg_vaps" ] || [ -z "$cfg_if_all" ]; then
+		echo "no config network vaps" > /dev/console
+		whc_wifi_config_unlock
+		echo "unlock whc_wifi_config_lock" > /dev/console
+		return
+	fi
+
+	for vapname in $cfg_vaps; do
+		if_name=$(uci show | grep vapname | grep "$vapname" | cut -d "=" -f 1 | cut -d "." -f 2)
+		uci_set wireless $if_name disabled 1
+	done
+
+	/sbin/wifi update vap "$cfg_if_all"
+
+	for vapname in $cfg_vaps; do
+		disable_config_network $vapname 1
+		disable_config_network $vapname 2
+	done
+
+    whc_wifi_config_unlock
+    echo "unlock whc_wifi_config_lock" > /dev/console
+}
+
+case "$1" in
+check) check_config_network ;;
+open) open_config_network ;;
+close) close_config_network ;;
+*) echo "Nothing to be done." > /dev/console ;;
+esac
